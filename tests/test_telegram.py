@@ -286,6 +286,20 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(reply_kwargs["reply_markup"], tg.ForceReply)
         self.assertEqual(tg.pending_pane(42, reply_message.message_id), "w0:p1")
 
+    async def test_read_output_is_styled_and_escaped_html(self):
+        # Arbitrary agent text must arrive escaped, with a glanceable header.
+        tg.agents = make_agents(1, status="working")
+        read_update = make_update()
+
+        with patch.object(tg, "read_pane", AsyncMock(return_value="fixed <bug> & shipped")):
+            await tg.cmd_read(read_update, SimpleNamespace(args=["project"]))
+
+        text, kwargs = read_update.message.replies[0][0], read_update.message.replies[0][1]
+        self.assertEqual(kwargs.get("parse_mode"), "HTML")
+        self.assertIn("<b>project</b>", text)
+        self.assertIn("<i>WORKING</i>", text)
+        self.assertIn("fixed &lt;bug&gt; &amp; shipped", text)
+
     async def test_send_and_reply_pickers_target_the_expected_actions(self):
         tg.agents = make_agents(1)
         send_update = make_update()
@@ -481,6 +495,75 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(content, "hello from pane")
 
+    async def test_read_pane_strips_tui_chrome_lines(self):
+        # pane_content is a rendered TUI frame: box borders, opencode's `┃` rail
+        # (user input + tool blocks), status/thought/footer markers must not
+        # reach the chat -- only the agent's plain reply text.
+        frame = "\n".join([
+            "┃ ╹▀▀▀▀▀▀▀▀▀▀…",
+            "┃────────────┃",
+            "  ┃  $ tail -4 ~/Library/Logs/herdr-remote/relay.log",
+            "  ┃  2026-09-02 20:52:08 [INFO] mDNS registering at 127.0.0.1",
+            "  ┃  look at this new response",
+            "  + Thought: 2.0s",
+            "  ▣  Build · GLM-5.3 · 48.5s",
+            "  ⚙️ codedb_codedb_read [path=relay/herdr_relay.py]",
+            "  /relay  59.3K (6%)  ctrl+p commands",
+            "",
+            "  Yes — now it works. Both services restarted with the fix.",
+        ])
+        connection = FakeRelayConnection([{"type": "pane_content", "content": frame}])
+
+        with patch("websockets.connect", return_value=connection):
+            content = await tg.read_pane("w0:p1")
+
+        self.assertEqual(content, "Yes — now it works. Both services restarted with the fix.")
+        # The viewport is read, not scrollback: old tool output and the
+        # multi-second `recent` harvest stay out of the phone view.
+        self.assertEqual(connection.sent[0]["source"], "visible")
+
+    async def test_session_lists_marks_active_and_switches(self):
+        list_update = make_update()
+        preamble = [{
+            "type": "sessions",
+            "sources": [{
+                "host": "local", "active": "main",
+                "sessions": [{"name": "main", "running": True},
+                             {"name": "scratch", "running": False}],
+            }],
+        }]
+        with patch("websockets.connect", return_value=FakeRelayConnection(preamble)):
+            await tg.cmd_session(list_update, SimpleNamespace(args=[]))
+        text, kwargs, _ = list_update.message.replies[0]
+        self.assertEqual(kwargs.get("parse_mode"), "HTML")
+        self.assertIn("<b>local</b>", text)
+        self.assertIn("▶ main", text)
+        self.assertIn("scratch (stopped)", text)
+
+        # One argument switches the local source (no host key); two name a host.
+        ok = [{"type": "command_result", "command": "session_switch", "ok": True,
+               "request_id": "request-123"}]
+        local_switch, remote_switch = make_update(), make_update()
+        with patch.object(tg.secrets, "token_hex", return_value="request-123"):
+            with patch("websockets.connect", return_value=FakeRelayConnection(list(ok))) as local_ws:
+                await tg.cmd_session(local_switch, SimpleNamespace(args=["scratch"]))
+            self.assertEqual(local_ws.return_value.sent[0]["type"], "session_switch")
+            self.assertEqual(local_ws.return_value.sent[0]["session"], "scratch")
+            self.assertNotIn("host", local_ws.return_value.sent[0])
+            self.assertIn("Switched local to scratch", local_switch.message.replies[0][0])
+
+            with patch("websockets.connect", return_value=FakeRelayConnection(list(ok))) as remote_ws:
+                await tg.cmd_session(remote_switch, SimpleNamespace(args=["pi@desk", "main"]))
+            self.assertEqual(remote_ws.return_value.sent[0]["host"], "pi@desk")
+            self.assertEqual(remote_ws.return_value.sent[0]["session"], "main")
+
+        # A relay rejection surfaces as a switch failure, not a crash.
+        rejected = [{"type": "error", "message": "unknown session: nope"}]
+        failed_update = make_update()
+        with patch("websockets.connect", return_value=FakeRelayConnection(rejected)):
+            await tg.cmd_session(failed_update, SimpleNamespace(args=["nope"]))
+        self.assertIn("unknown session: nope", failed_update.message.replies[0][0])
+
     def test_relay_allows_numeric_approval_keys_and_acknowledges_them(self):
         relay_path = ROOT / "relay" / "herdr_relay.py"
         source = relay_path.read_text(encoding="utf-8")
@@ -520,6 +603,71 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
 
         send_to_relay.assert_awaited_once_with("w0:p1", "Blue", prompt_id="prompt-123")
         send_keys.assert_not_awaited()
+
+    async def test_opencode_permission_buttons_send_option_text(self):
+        # OpenCode's button row answers to its option text (the relay maps it to
+        # Tab/Enter keystrokes), never to a numeric key press.
+        tg.relay_connected = True
+        tg.agents = make_agents(1, status="blocked")
+        tg.blocked_prompt_ids["w0:p1"] = "prompt-123"
+        markup = tg.make_keyboard(
+            "w0:p1",
+            ["Allow once", "Allow always", "Reject"],
+            generation="generation",
+            interaction="opencode_permission",
+        )
+        tg.approval_tokens["w0:p1"] = "generation"
+        callback = FakeCallback(markup.inline_keyboard[1][0].callback_data)
+        callback.message.reply_markup = markup
+
+        with (
+            patch.object(tg, "send_to_relay", AsyncMock()) as send_to_relay,
+            patch.object(tg, "send_keys_to_relay", AsyncMock()) as send_keys,
+        ):
+            await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+
+        send_to_relay.assert_awaited_once_with("w0:p1", "Allow always", prompt_id="prompt-123")
+        send_keys.assert_not_awaited()
+
+    async def test_opencode_question_buttons_send_option_text(self):
+        tg.relay_connected = True
+        tg.agents = make_agents(1, status="blocked")
+        tg.blocked_prompt_ids["w0:p1"] = "prompt-123"
+        markup = tg.make_keyboard(
+            "w0:p1",
+            ["Both (Recommended)", "Table only", "Skip admin UI"],
+            generation="generation",
+            interaction="opencode_question",
+        )
+        tg.approval_tokens["w0:p1"] = "generation"
+        callback = FakeCallback(markup.inline_keyboard[0][0].callback_data)
+        callback.message.reply_markup = markup
+
+        with (
+            patch.object(tg, "send_to_relay", AsyncMock()) as send_to_relay,
+            patch.object(tg, "send_keys_to_relay", AsyncMock()) as send_keys,
+        ):
+            await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+
+        send_to_relay.assert_awaited_once_with(
+            "w0:p1", "Both (Recommended)", prompt_id="prompt-123")
+        send_keys.assert_not_awaited()
+
+    async def test_opencode_review_button_confirms(self):
+        markup = tg.make_keyboard(
+            "w0:p1", ["Confirm"], generation="generation", interaction="opencode_review",
+        )
+        tg.relay_connected = True
+        tg.agents = make_agents(1, status="blocked")
+        tg.blocked_prompt_ids["w0:p1"] = "prompt-123"
+        tg.approval_tokens["w0:p1"] = "generation"
+        callback = FakeCallback(markup.inline_keyboard[0][0].callback_data)
+        callback.message.reply_markup = markup
+
+        with patch.object(tg, "send_to_relay", AsyncMock()) as send_to_relay:
+            await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+
+        send_to_relay.assert_awaited_once_with("w0:p1", "Confirm", prompt_id="prompt-123")
 
     def test_relay_disconnect_clears_approval_generations(self):
         tg.relay_connected = True

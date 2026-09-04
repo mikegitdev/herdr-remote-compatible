@@ -1424,6 +1424,150 @@ class RelayQuestionTests(unittest.TestCase):
                 relay.question_prompt_id("pane-1", second),
             )
 
+    def test_read_pane_drops_heavy_box_drawing_chrome(self):
+        # TUIs render progress bars with heavy/half-block glyphs (┃ ╹▀▀▀…) that the
+        # original light-only character class let through to clients.
+        pane_output = "\n".join([
+            "┃ ╹▀▀▀▀▀▀▀▀▀▀…",
+            "┃────────────┃",
+            "real output line",
+        ])
+
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "run_herdr", return_value=pane_output):
+                self.assertEqual(relay.read_pane("pane-1"), "real output line")
+
+    # Captured from a live OpenCode pane waiting on a permission prompt
+    # (read_pane output: bare rail lines are already chrome-filtered away).
+    OPENCODE_PERMISSION_SCREEN = "\n".join([
+        "+ Thought: 2.1s",
+        "",
+        "⠴ Read ~/app/lib/core/services/leave_service.dart",
+        "",
+        "▣  Plan · GLM-5.3",
+        "┃  △ Permission required",
+        "┃    ← Access external directory ~/app/lib/core/services",
+        "┃  Patterns",
+        "┃  - /Users/x/app/lib/core/services/*",
+        "┃   Allow once   Allow always   Reject                               ctrl+f fullscreen  ⇆ select  enter confirm",
+    ])
+
+    def test_opencode_permission_options_and_stable_identity(self):
+        # The spinner and Thought timer keep moving while the prompt waits; the
+        # blocked fingerprint must not, or every poll re-notifies clients.
+        later = self.OPENCODE_PERMISSION_SCREEN.replace("⠴", "⠸").replace("2.1s", "3.4s")
+        with loaded_relay() as relay:
+            first = relay.blocked_message("pane-1", "opencode", "nodehr", "local",
+                                          self.OPENCODE_PERMISSION_SCREEN)
+            second = relay.blocked_message("pane-1", "opencode", "nodehr", "local", later)
+
+            self.assertEqual(first["options"], relay.OPENCODE_OPTIONS)
+            self.assertEqual(first["interaction"], "opencode_permission")
+            self.assertEqual(first["prompt_id"], second["prompt_id"])
+            self.assertEqual(first["prompt"], second["prompt"])
+            self.assertNotIn("⠴", first["prompt"])
+            self.assertNotIn("Thought", first["prompt"])
+
+    def test_opencode_permission_responses_are_tab_enter_keystrokes(self):
+        with loaded_relay() as relay:
+            for label, keys in (
+                ("Allow once", ("Enter",)),
+                ("Allow always", ("Tab", "Enter")),
+                ("Reject", ("Tab", "Tab", "Enter")),
+            ):
+                with mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                    self.assertTrue(relay.respond_opencode_permission(
+                        "pane-1", label, self.OPENCODE_PERMISSION_SCREEN))
+                    mutate.assert_called_once_with(
+                        "pane", "send-keys", "pane-1", *keys, remote=None)
+
+            # Only the permission dialog answers to these labels.
+            with mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertFalse(relay.respond_opencode_permission(
+                    "pane-1", "Allow once", "no dialog here"))
+                mutate.assert_not_called()
+
+    # Captured from a live OpenCode pane waiting on a Question Prompt
+    # (numbered options, per-option descriptions, type-your-own, ↑↓ hint).
+    OPENCODE_QUESTION_SCREEN = "\n".join([
+        "┃   Admin UI scope   Backend extras   Mobile approve   Confirm",
+        "┃  Include the admin web screens (org-wide balances table + HR grant/deduct UI) in this pass?",
+        "┃  1. Both (Recommended)",
+        "┃     Org-wide balances table + HR grant/deduct drawer — completes the HR workflow",
+        "┃  2. Table only",
+        "┃     Org-wide balances table; adjustments stay API-only for now",
+        "┃  3. Skip admin UI",
+        "┃     Employee self-service only for this pass",
+        "┃  4. Type your own answer",
+        "┃  ⇆ tab  ↑↓ select  enter confirm  esc dismiss",
+    ])
+
+    def test_opencode_question_options_and_interaction(self):
+        with loaded_relay() as relay:
+            message = relay.blocked_message("pane-1", "opencode", "nodehr", "local",
+                                            self.OPENCODE_QUESTION_SCREEN)
+            # The type-your-own option needs text, not a button.
+            self.assertEqual(message["options"],
+                             ["Both (Recommended)", "Table only", "Skip admin UI"])
+            self.assertEqual(message["interaction"], "opencode_question")
+
+    def test_opencode_question_responses_navigate_and_confirm(self):
+        with loaded_relay() as relay:
+            # A known option: ↓ to it, Enter.
+            with mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertTrue(relay.respond_opencode_question(
+                    "pane-1", "Table only", self.OPENCODE_QUESTION_SCREEN))
+                mutate.assert_called_once_with(
+                    "pane", "send-keys", "pane-1", "Down", "Enter", remote=None)
+
+            # Free text: select type-your-own, Enter, then type and submit.
+            with mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate, \
+                    mock.patch.object(relay.time, "sleep"):
+                self.assertTrue(relay.respond_opencode_question(
+                    "pane-1", "MariaDB please", self.OPENCODE_QUESTION_SCREEN))
+                self.assertEqual(mutate.call_args_list, [
+                    mock.call("pane", "send-keys", "pane-1",
+                              "Down", "Down", "Down", "Enter", remote=None),
+                    mock.call("pane", "send-text", "pane-1", "MariaDB please", remote=None),
+                    mock.call("pane", "send-keys", "pane-1", "Enter", remote=None),
+                ])
+
+            # Numbered output alone is not a question, and neither is the
+            # permission row (its hint has no ↑↓).
+            self.assertIsNone(relay.detect_opencode_question("1. some old list item"))
+            self.assertIsNone(relay.detect_opencode_question(self.OPENCODE_PERMISSION_SCREEN))
+
+    # The wizard's final Confirm tab: Review summary, `enter submit` hint.
+    OPENCODE_REVIEW_SCREEN = "\n".join([
+        "┃   Admin UI scope   Backend extras   Mobile approve   Confirm",
+        "┃  Review",
+        "┃  Admin UI scope: Both (Recommended)",
+        "┃  Backend extras: Both (Recommended)",
+        "┃  Mobile approve: Yes, switch (Recommended)",
+        "┃  ⇆ tab  enter submit  esc dismiss",
+    ])
+
+    def test_opencode_review_tab_offers_confirm(self):
+        with loaded_relay() as relay:
+            message = relay.blocked_message("pane-1", "opencode", "nodehr", "local",
+                                            self.OPENCODE_REVIEW_SCREEN)
+            self.assertEqual(message["options"], ["Confirm"])
+            self.assertEqual(message["interaction"], "opencode_review")
+
+            with mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertTrue(relay.respond_opencode_review(
+                    "pane-1", "Confirm", self.OPENCODE_REVIEW_SCREEN))
+                mutate.assert_called_once_with(
+                    "pane", "send-keys", "pane-1", "Enter", remote=None)
+
+            # Only the Review tab takes a Confirm, and only that word.
+            self.assertFalse(relay.respond_opencode_review(
+                "pane-1", "Confirm", self.OPENCODE_QUESTION_SCREEN))
+            with mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertFalse(relay.respond_opencode_review(
+                    "pane-1", "nope", self.OPENCODE_REVIEW_SCREEN))
+                mutate.assert_not_called()
+
     def test_prompt_identity_ignores_multi_selection_state(self):
         with loaded_relay() as relay:
             self.assertEqual(

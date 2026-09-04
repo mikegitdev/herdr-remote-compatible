@@ -217,7 +217,10 @@ class ClientPayloadTests(unittest.TestCase):
         self.assertIn("PromptReadLines = 50", poller)
         self.assertIn("lines[-50:]", relay)
         self.assertIn("PromptKeepLines = 20", poller)
-        self.assertIn('"prompt": content[-500:]', relay)
+        # Both sides cut the preview to the last 500 characters; the relay additionally
+        # drops volatile lines (spinners, timers) first, so a waiting prompt's preview
+        # and identity stay byte-stable between polls.
+        self.assertIn('"prompt": stable[-500:]', relay)
         self.assertIn("PromptMaxChars = 500", poller)
         self.assertIn("prompt[^PromptMaxChars..]", poller)
 
