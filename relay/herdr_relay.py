@@ -154,8 +154,16 @@ REMOTES = [r.strip() for r in os.environ.get("HERDR_REMOTES", "").split(",") if 
 
 TOOL_OPTIONS = ["yes, single permission", "trust, always allow", "no (tab to edit)"]
 SUBAGENT_OPTIONS = ["approve all pending", "configure individually", "exit (cancel subagents)"]
+OPENCODE_OPTIONS = ["Allow once", "Allow always", "Reject"]
+# OpenCode's permission footer is a Tab-cycled button row with the first button
+# focused ("⇆ select  enter confirm"): it answers to keystrokes, not typed text.
+OPENCODE_PERMISSION_KEYS = {
+    "allow once": ("Enter",),
+    "allow always": ("Tab", "Enter"),
+    "reject": ("Tab", "Tab", "Enter"),
+}
 CHROME_RE = re.compile(
-    r"^[\s\u2500\u2501\u2550_\u2014\u2502|\u25d4\u25d1\u25d5\u25cf\s]+$"
+    r"^[\s\u2500-\u257f\u2580-\u259f\u2014\u2026_|\u25d4\u25d1\u25d5\u25cf\s]+$"
     r"|Kiro\s[\u00b7\u2022]"
     r"|esc to cancel"
     r"|type to queue"
@@ -1529,6 +1537,8 @@ def detect_approval_options(text):
         return TOOL_OPTIONS
     if "approve all pending" in lower:
         return SUBAGENT_OPTIONS
+    if "allow always" in lower and "reject" in lower:
+        return OPENCODE_OPTIONS
     return []
 
 
@@ -1551,10 +1561,24 @@ def custom_editor_active(text):
         "Custom answer:" in text and "submit" in text.lower()
     )
 
+# Lines that keep changing while a prompt sits waiting -- the braille spinner cycles per
+# frame, Thought timers tick, the mode line switches per tool. They must not feed the
+# blocked fingerprint, or every poll looks like a brand-new prompt and re-notifies.
+VOLATILE_LINE_RE = re.compile(
+    r"^\s*[\u2800-\u28ff]"
+    r"|^\s*\+ Thought: \d"
+    r"|^\s*\u25a3"
+)
+
+
+def stable_pane_text(text):
+    return "\n".join(line for line in text.splitlines() if not VOLATILE_LINE_RE.search(line))
+
+
 def question_prompt_id(pane_id, content):
     question = detect_question(content)
     if not question:
-        normalized = " ".join(content.split())
+        normalized = " ".join(stable_pane_text(content).split())
         return hashlib.sha256(f"{pane_id}\n{normalized}".encode("utf-8")).hexdigest()[:20]
     labels = [
         option["label"] for option in question["options"]
@@ -1580,14 +1604,26 @@ def prompt_matches(pane_id, prompt_id, remote=None):
 
 def blocked_message(pane_id, agent, project, host, content):
     question = detect_question(content) if agent == "omp" else None
-    options = detect_options(content) if agent == "omp" else detect_approval_options(content)
+    oc_question = detect_opencode_question(content) if agent == "opencode" else None
+    oc_review = (
+        detect_opencode_review(content)
+        if agent == "opencode" and oc_question is None else False
+    )
+    if oc_question is not None:
+        # The type-your-own option needs text, not a button; free replies route to it.
+        options = [label for label in oc_question if label != OPENCODE_TYPE_OWN]
+    elif oc_review:
+        options = OPENCODE_REVIEW_OPTIONS
+    else:
+        options = detect_options(content) if agent == "omp" else detect_approval_options(content)
+    stable = stable_pane_text(content)
     return {
         "type": "blocked",
         "pane_id": pane_id,
         "agent": agent,
         "project": project,
         "host": host,
-        "prompt": content[-500:],
+        "prompt": stable[-500:],
         "prompt_id": question_prompt_id(pane_id, content),
         "options": [] if question and question["multi"] else options,
         "multi_options": options if question and question["multi"] else [],
@@ -1596,7 +1632,13 @@ def blocked_message(pane_id, agent, project, host, content):
             if option["multi"] and option["label"] != QUESTION_OTHER
             and "Done selecting" not in option["label"] and option["checked"]
         ] if question else [],
-        "interaction": "omp_question" if question else "prompt",
+        "interaction": (
+            "omp_question" if question
+            else "opencode_question" if oc_question is not None
+            else "opencode_review" if oc_review
+            else "opencode_permission" if options == OPENCODE_OPTIONS
+            else "prompt"
+        ),
         "multi": bool(question and question["multi"]),
         "update": False,
     }
@@ -1630,6 +1672,112 @@ def toggle_question_option(pane_id, option_label, remote=None):
     if target_index is None or not move_question_cursor(pane_id, question, target_index, remote=remote):
         return False
     return _mutate_herdr("pane", "send-keys", pane_id, "Enter", remote=remote)
+
+
+def respond_opencode_permission(pane_id, text, content, remote=None):
+    """Answer OpenCode's permission row with the keystrokes it understands.
+
+    The row's own hint line says it: `⇆ select  enter confirm`. Typing the
+    option's text at it does nothing, so map each label to Tab counts + Enter
+    from the default focus on the first button.
+    """
+    if "permission required" not in content.lower():
+        return False
+    keys = OPENCODE_PERMISSION_KEYS.get(text.strip().lower())
+    if not keys:
+        return False
+    return _mutate_herdr("pane", "send-keys", pane_id, *keys, remote=remote)
+
+
+OPENCODE_TYPE_OWN = "Type your own answer"
+OPENCODE_REVIEW_OPTIONS = ["Confirm"]
+
+
+def detect_opencode_review(text):
+    """OpenCode's wizard Confirm tab: a Review summary over an `enter submit` hint.
+
+    The question tabs' hint says `enter confirm`, the permission row's has no esc
+    line -- only the final Review tab says `enter submit`, so that phrase is the
+    marker. Pressing Enter submits the whole wizard.
+    """
+    return any(
+        "enter submit" in line and "esc dismiss" in line
+        for line in (raw.strip().strip("\u2502\u2503|").strip() for raw in text.splitlines())
+    )
+
+
+def respond_opencode_review(pane_id, text, content, remote=None):
+    if not detect_opencode_review(content):
+        return False
+    if text.strip().lower() != "confirm":
+        return False
+    return _mutate_herdr("pane", "send-keys", pane_id, "Enter", remote=remote)
+
+
+def detect_opencode_question(text):
+    """Parse OpenCode's Question Prompt: numbered options over a `↑↓ select` hint.
+
+    The hint line (tab, ↑↓ select, enter confirm, esc dismiss) only renders in
+    the question dialog -- the permission row's hint has no ↑↓, so that is the
+    separator. Selection starts on option 1; descriptions between options are
+    indented and never numbered, so the walk up counts N, N-1, ... and stops
+    the moment the numbering breaks. Returns the option labels in order, or
+    None when no question dialog is up.
+    """
+    lines = [line.strip().strip("\u2502\u2503|").strip() for line in text.splitlines()]
+    hint_index = next(
+        (i for i in range(len(lines) - 1, -1, -1)
+         if "↑↓" in lines[i] and "enter confirm" in lines[i]),
+        None,
+    )
+    if hint_index is None:
+        return None
+    found = []
+    expected = None
+    for i in range(hint_index - 1, -1, -1):
+        match = re.match(r"^(\d+)\.\s+(.+)$", lines[i])
+        if not match:
+            continue
+        number = int(match.group(1))
+        if expected is not None and number != expected:
+            break
+        found.append(match.group(2).strip())
+        expected = number - 1
+        if number == 1:
+            break
+    return list(reversed(found)) or None
+
+
+def respond_opencode_question(pane_id, text, content, remote=None):
+    """Answer OpenCode's Question Prompt: ↓ to the option, Enter to confirm.
+
+    Free text goes through the trailing `N. Type your own answer` option: select
+    it, Enter to focus its input, then type and Enter again.
+    """
+    options = detect_opencode_question(content)
+    if not options:
+        return False
+    target = next(
+        (i for i, label in enumerate(options) if label.casefold() == text.strip().casefold()),
+        None,
+    )
+    custom = target is None
+    if custom:
+        target = next(
+            (i for i, label in enumerate(options) if label == OPENCODE_TYPE_OWN), None
+        )
+        if target is None:
+            return False
+    keys = ["Down"] * target + ["Enter"]
+    if not _mutate_herdr("pane", "send-keys", pane_id, *keys, remote=remote):
+        return False
+    if not custom:
+        return True
+    # ponytail: fixed beat instead of polling for the input; bump if slow TUIs miss it
+    time.sleep(0.5)
+    return _mutate_herdr("pane", "send-text", pane_id, text, remote=remote) and _mutate_herdr(
+        "pane", "send-keys", pane_id, "Enter", remote=remote
+    )
 
 
 def submit_multi_question(pane_id, remote=None):
@@ -2167,6 +2315,18 @@ async def handle_client(ws):
                     delivered = await asyncio.to_thread(
                         respond_to_question, pane_id, text, question, remote=remote
                     )
+                elif await asyncio.to_thread(
+                    respond_opencode_permission, pane_id, text, content, remote=remote
+                ):
+                    delivered = True
+                elif await asyncio.to_thread(
+                    respond_opencode_question, pane_id, text, content, remote=remote
+                ):
+                    delivered = True
+                elif await asyncio.to_thread(
+                    respond_opencode_review, pane_id, text, content, remote=remote
+                ):
+                    delivered = True
                 elif custom_editor_active(content) or text.lower() in SAFE_RESPONSES:
                     delivered = await asyncio.to_thread(
                         _mutate_herdr, "pane", "send-text", pane_id, text, remote=remote

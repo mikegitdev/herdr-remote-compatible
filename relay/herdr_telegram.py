@@ -4,7 +4,7 @@
 # dependencies = ["python-telegram-bot>=21.0", "websockets>=14.0"]
 # ///
 """herdr-remote Telegram bot — monitor and approve agents from Telegram."""
-import asyncio, hashlib, json, os, logging, secrets
+import asyncio, hashlib, html, json, os, logging, re, secrets
 from collections import Counter, OrderedDict
 
 from telegram import ForceReply, Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -53,6 +53,27 @@ AGENT_PAGE_SIZE = 20
 PENDING_LIMIT = 500
 COMMAND_ACK_TIMEOUT = 20
 PANE_READ_TIMEOUT = 20
+# Terminal chrome that is not part of the output. Port of CHROME_RE (herdr_relay.py).
+# herdr_telegram must not import herdr_relay (its import validates env and can SystemExit),
+# so the pattern is copied, as the Windows client does (HerdrPoller.cs).
+CHROME_RE = re.compile(
+    r"^[\s\u2500-\u257f\u2580-\u259f\u2014\u2026_|\u25d4\u25d1\u25d5\u25cf\s]+$"
+    r"|Kiro\s[\u00b7\u2022]"
+    r"|esc to cancel"
+    r"|type to queue"
+    r"|^\s*[\u25d4\u25d1\u25d5\u25cf]\s+(Shell|Bash)"
+)
+# OpenCode's inline TUI marks structure on text lines: a `┃`/`│` rail prefixes
+# user input and tool blocks (the agent's own reply is plain unrailled text),
+# `▣` status, `+ Thought:` timers, `⚙` tool echoes, `ctrl+p` the footer hint.
+TUI_MARK_RE = re.compile(
+    r"^[\s\u2502\u2503]*[\u2502\u2503]\s"
+    r"|^\s*\u25a3"
+    r"|^\s*\+ Thought:"
+    r"|^\s*\u2699"
+    r"|^\s*\$ "
+    r"|ctrl\+p"
+)
 STATUS_ORDER = {"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 3}
 STATUS_LABELS = {"blocked": "BLOCKED", "working": "WORKING", "done": "DONE", "idle": "IDLE", "unknown": "IDLE"}
 ACTION_CODES = {
@@ -125,12 +146,14 @@ async def send_keys_to_relay(pane_id: str, keys: list[str], prompt_id: str | Non
         await await_command_result(ws, request_id, "send_keys")
 
 
-async def read_pane(pane_id: str, lines: int = 15) -> str:
-    """Read pane content from relay."""
+async def read_pane(pane_id: str, lines: int = 100) -> str:
+    """Read pane content from relay, stripped of TUI chrome (borders, spinners)."""
     import websockets
     try:
         async with websockets.connect(RELAY_WS) as ws:
-            await ws.send(json.dumps({"type": "read_pane", "pane_id": pane_id, "lines": lines}))
+            await ws.send(json.dumps({
+                "type": "read_pane", "pane_id": pane_id, "lines": lines, "source": "visible",
+            }))
             loop = asyncio.get_running_loop()
             deadline = loop.time() + PANE_READ_TIMEOUT
             # The connect preamble (sessions/agents/one-blocked-per-blocked-
@@ -143,9 +166,50 @@ async def read_pane(pane_id: str, lines: int = 15) -> str:
                 raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
                 msg = json.loads(raw)
                 if msg.get("type") == "pane_content":
-                    return msg.get("content", "(empty)")
+                    content = msg.get("content", "(empty)")
+                    kept = [
+                        stripped for stripped in (
+                            line.strip() for line in content.splitlines()
+                        )
+                        if stripped
+                        and not CHROME_RE.search(stripped)
+                        and not TUI_MARK_RE.search(stripped)
+                    ]
+                    return "\n".join(kept[-50:]) if kept else "(no output)"
     except Exception as e:
         return f"(error reading pane: {scrub(e)})"
+
+
+async def fetch_sessions() -> list[dict] | None:
+    """Per-host session lists from the relay's connect preamble."""
+    import websockets
+    try:
+        async with websockets.connect(RELAY_WS) as ws:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + PANE_READ_TIMEOUT
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return None
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                msg = json.loads(raw)
+                if msg.get("type") == "sessions":
+                    return msg.get("sources", [])
+    except Exception as e:
+        log.warning("Failed to read sessions: %s", scrub(e))
+        return None
+
+
+async def switch_session(host: str, session: str):
+    """Point one host at a named session; raises on relay rejection."""
+    import websockets
+    async with websockets.connect(RELAY_WS) as ws:
+        request_id = secrets.token_hex(8)
+        message = {"type": "session_switch", "session": session, "request_id": request_id}
+        if host != "local":
+            message["host"] = host
+        await ws.send(json.dumps(message))
+        await await_command_result(ws, request_id, "session_switch")
 
 
 async def send_text_to_relay(pane_id: str, text: str):
@@ -199,20 +263,38 @@ def clear_relay_connection_state():
 
 
 async def send_reply_prompt(message, chat, agent: dict, content: str | None = None):
-    project = agent.get("project") or agent.get("agent") or "agent"
-    parts = [f"{project}:"]
-    if content is not None:
-        parts.extend(["", content])
-    parts.extend(["", "Reply to this message to send your response."])
+    parts = [pane_content_message(agent, content or "", limit=3000), "",
+             "Reply to this message to send your response."]
     kwargs = {}
     if getattr(chat, "type", None) == "private":
         kwargs["reply_markup"] = ForceReply(
             selective=True,
-            input_field_placeholder=f"Reply to {project}"[:64],
+            input_field_placeholder=f"Reply to {agent.get('project') or agent.get('agent') or 'agent'}"[:64],
         )
-    sent = await message.reply_text("\n".join(parts), **kwargs)
+    sent = await message.reply_text("\n".join(parts), parse_mode="HTML", **kwargs)
     register_pending(chat.id, sent.message_id, agent["pane_id"])
     return sent
+
+
+STATUS_EMOJI = {"blocked": "🛑", "working": "⚙️", "done": "✅", "idle": "💬", "unknown": "💬"}
+
+
+def pane_content_message(agent: dict, content: str, limit: int = 3500) -> str:
+    """One glanceable Telegram message: status header, then the agent's reply.
+
+    HTML, not Markdown: agent output can contain * _ ` freely and must only be
+    escaped, never interpreted.
+    """
+    status = agent.get("status", "unknown")
+    project = agent.get("project") or agent.get("agent") or "agent"
+    if len(content) > limit:
+        content = content[-limit:]
+    header = (
+        f"{STATUS_EMOJI.get(status, '💬')} <b>{html.escape(project)}</b>"
+        f" · {html.escape(agent.get('agent', ''))} · <i>{STATUS_LABELS.get(status, 'IDLE')}</i>"
+    )
+    body = html.escape(content) if content else "<i>(no output yet)</i>"
+    return f"{header}\n\n{body}"
 
 
 def agents_for_action(action: str) -> list[dict]:
@@ -433,6 +515,41 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /session — list herdr sessions; /session <name> or /session <host> <name> switches."""
+    args = ctx.args
+    if not args:
+        sources = await fetch_sessions()
+        if sources is None:
+            await update.message.reply_text("Could not read sessions from the relay.")
+            return
+        lines = []
+        for source in sources:
+            host = source.get("host", "?")
+            active = source.get("active")
+            entries = ", ".join(
+                f"▶ {entry['name']}" if entry["name"] == active
+                else entry["name"] + ("" if entry.get("running") else " (stopped)")
+                for entry in source.get("sessions", [])
+            ) or "none"
+            suffix = "" if active else " (herdr default)"
+            lines.append(f"<b>{html.escape(host)}</b>: {html.escape(entries)}{suffix}")
+        await update.message.reply_text(
+            "Sessions (▶ active):\n" + "\n".join(lines)
+            + "\n\nSwitch: /session <name>, or /session <host> <name> for a remote.",
+            parse_mode="HTML",
+        )
+        return
+
+    host, session = ("local", args[0]) if len(args) == 1 else (args[0], " ".join(args[1:]))
+    try:
+        await switch_session(host, session)
+    except Exception as e:
+        await update.message.reply_text(f"Switch failed: {scrub(e)}")
+        return
+    await update.message.reply_text(f"Switched {host} to {session}. Use /agents to see its panes.")
+
+
 async def cmd_read(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /read [project] — read pane output."""
     args = ctx.args
@@ -452,9 +569,7 @@ async def cmd_read(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     content = await read_pane(match["pane_id"])
-    if len(content) > 3500:
-        content = content[-3500:]
-    msg = await update.message.reply_text(f"{match['project']}:\n\n{content}")
+    msg = await update.message.reply_text(pane_content_message(match, content), parse_mode="HTML")
     register_pending(update.effective_chat.id, msg.message_id, match["pane_id"])
 
 
@@ -538,8 +653,6 @@ async def cmd_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     content = await read_pane(match["pane_id"])
-    if len(content) > 3000:
-        content = content[-3000:]
     await send_reply_prompt(update.message, update.effective_chat, match, content)
 
 
@@ -637,9 +750,9 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "read":
         content = await read_pane(data["pane_id"])
-        if len(content) > 3500:
-            content = content[-3500:]
-        msg = await query.message.reply_text(f"{content}")
+        msg = await query.message.reply_text(
+            pane_content_message(selected_agent, content), parse_mode="HTML"
+        )
         register_pending(update.effective_chat.id, msg.message_id, data["pane_id"])
         return
 
@@ -657,8 +770,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "select_reply":
         content = await read_pane(data["pane_id"])
-        if len(content) > 3000:
-            content = content[-3000:]
         await send_reply_prompt(query.message, update.effective_chat, selected_agent, content)
         return
 
@@ -807,7 +918,13 @@ def make_keyboard(
 ) -> InlineKeyboardMarkup:
     if not options:
         return interaction_keyboard(pane_id)
-    if interaction == "omp_question":
+    # omp_question, opencode_question and opencode_permission all answer to their
+    # option TEXT via `respond` (the relay maps it to keystrokes); the numeric-key
+    # path below is for Claude-style prompts where only a real key press works.
+    text_responses = interaction in (
+        "omp_question", "opencode_question", "opencode_review", "opencode_permission",
+    )
+    if text_responses:
         buttons = [(opt, opt) for opt in options]
     elif "trust" in " ".join(options).lower():
         buttons = TOOL_BUTTONS
@@ -817,7 +934,7 @@ def make_keyboard(
         buttons = [(opt.split(",")[0], opt) for opt in options]
 
     generation = generation or secrets.token_hex(4)
-    if interaction == "omp_question":
+    if text_responses:
         keyboard = [
             [InlineKeyboardButton(label, callback_data=pane_callback_data(
                 "approval", pane_id, g=generation, i=str(i),
@@ -1014,6 +1131,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start, filters=auth_filter))
     app.add_handler(CommandHandler("agents", cmd_agents, filters=auth_filter))
     app.add_handler(CommandHandler("status", cmd_status, filters=auth_filter))
+    app.add_handler(CommandHandler("session", cmd_session, filters=auth_filter))
     app.add_handler(CommandHandler("read", cmd_read, filters=auth_filter))
     app.add_handler(CommandHandler("reply", cmd_reply, filters=auth_filter))
     app.add_handler(CommandHandler("send", cmd_send, filters=auth_filter))
