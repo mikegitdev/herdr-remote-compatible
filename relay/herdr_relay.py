@@ -1609,13 +1609,23 @@ def blocked_message(pane_id, agent, project, host, content):
         detect_opencode_review(content)
         if agent == "opencode" and oc_question is None else False
     )
+    oc_permission = (
+        agent == "opencode" and oc_question is None and not oc_review
+        and detect_approval_options(content) == OPENCODE_OPTIONS
+    )
     if oc_question is not None:
         # The type-your-own option needs text, not a button; free replies route to it.
         options = [label for label in oc_question if label != OPENCODE_TYPE_OWN]
     elif oc_review:
         options = OPENCODE_REVIEW_OPTIONS
+    elif oc_permission:
+        options = OPENCODE_OPTIONS
     else:
         options = detect_options(content) if agent == "omp" else detect_approval_options(content)
+    if oc_question is not None or oc_review or oc_permission:
+        # Every opencode dialog takes an Esc; carrying it in `options` means the
+        # web client gets the button from the same message Telegram does.
+        options = [*options, OPENCODE_DISMISS]
     stable = stable_pane_text(content)
     return {
         "type": "blocked",
@@ -1636,7 +1646,7 @@ def blocked_message(pane_id, agent, project, host, content):
             "omp_question" if question
             else "opencode_question" if oc_question is not None
             else "opencode_review" if oc_review
-            else "opencode_permission" if options == OPENCODE_OPTIONS
+            else "opencode_permission" if oc_permission
             else "prompt"
         ),
         "multi": bool(question and question["multi"]),
@@ -1691,6 +1701,25 @@ def respond_opencode_permission(pane_id, text, content, remote=None):
 
 OPENCODE_TYPE_OWN = "Type your own answer"
 OPENCODE_REVIEW_OPTIONS = ["Confirm"]
+OPENCODE_DISMISS = "Dismiss"
+
+
+def respond_opencode_dismiss(pane_id, text, content, remote=None):
+    """Esc dismisses any OpenCode dialog -- every hint line says `esc dismiss`.
+
+    Must run before respond_opencode_question: "Dismiss" is not an option label
+    there, so it would otherwise fall into the type-your-own path and get typed
+    into the answer input.
+    """
+    if text.strip().lower() != "dismiss":
+        return False
+    if not (
+        detect_opencode_question(content)
+        or detect_opencode_review(content)
+        or "permission required" in content.lower()
+    ):
+        return False
+    return _mutate_herdr("pane", "send-keys", pane_id, "Escape", remote=remote)
 
 
 def detect_opencode_review(text):
@@ -1922,7 +1951,7 @@ async def _poll_once():
                     await broadcast(message)
                     await send_web_push(
                         title=f"\U0001f411 {a['project']} blocked",
-                        body=content[:120],
+                        body=stable_pane_text(content)[:120],
                         url=f"/?pane={pid}",
                     )
                     if gen != POLL_GENERATION:
@@ -2315,6 +2344,10 @@ async def handle_client(ws):
                     delivered = await asyncio.to_thread(
                         respond_to_question, pane_id, text, question, remote=remote
                     )
+                elif await asyncio.to_thread(
+                    respond_opencode_dismiss, pane_id, text, content, remote=remote
+                ):
+                    delivered = True
                 elif await asyncio.to_thread(
                     respond_opencode_permission, pane_id, text, content, remote=remote
                 ):
