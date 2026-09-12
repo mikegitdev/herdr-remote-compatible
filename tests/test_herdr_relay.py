@@ -1461,7 +1461,7 @@ class RelayQuestionTests(unittest.TestCase):
                                           self.OPENCODE_PERMISSION_SCREEN)
             second = relay.blocked_message("pane-1", "opencode", "nodehr", "local", later)
 
-            self.assertEqual(first["options"], relay.OPENCODE_OPTIONS)
+            self.assertEqual(first["options"], [*relay.OPENCODE_OPTIONS, relay.OPENCODE_DISMISS])
             self.assertEqual(first["interaction"], "opencode_permission")
             self.assertEqual(first["prompt_id"], second["prompt_id"])
             self.assertEqual(first["prompt"], second["prompt"])
@@ -1508,7 +1508,8 @@ class RelayQuestionTests(unittest.TestCase):
                                             self.OPENCODE_QUESTION_SCREEN)
             # The type-your-own option needs text, not a button.
             self.assertEqual(message["options"],
-                             ["Both (Recommended)", "Table only", "Skip admin UI"])
+                             ["Both (Recommended)", "Table only", "Skip admin UI",
+                              relay.OPENCODE_DISMISS])
             self.assertEqual(message["interaction"], "opencode_question")
 
     def test_opencode_question_responses_navigate_and_confirm(self):
@@ -1551,7 +1552,7 @@ class RelayQuestionTests(unittest.TestCase):
         with loaded_relay() as relay:
             message = relay.blocked_message("pane-1", "opencode", "nodehr", "local",
                                             self.OPENCODE_REVIEW_SCREEN)
-            self.assertEqual(message["options"], ["Confirm"])
+            self.assertEqual(message["options"], ["Confirm", relay.OPENCODE_DISMISS])
             self.assertEqual(message["interaction"], "opencode_review")
 
             with mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
@@ -1567,6 +1568,40 @@ class RelayQuestionTests(unittest.TestCase):
                 self.assertFalse(relay.respond_opencode_review(
                     "pane-1", "nope", self.OPENCODE_REVIEW_SCREEN))
                 mutate.assert_not_called()
+
+    def test_opencode_dismiss_escapes_any_dialog(self):
+        screens = (
+            self.OPENCODE_QUESTION_SCREEN,
+            self.OPENCODE_REVIEW_SCREEN,
+            self.OPENCODE_PERMISSION_SCREEN,
+        )
+        with loaded_relay() as relay:
+            for screen in screens:
+                with mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                    self.assertTrue(
+                        relay.respond_opencode_dismiss("pane-1", "Dismiss", screen),
+                        msg=screen[:40])
+                    mutate.assert_called_once_with(
+                        "pane", "send-keys", "pane-1", "Escape", remote=None)
+
+            # Not a dismiss word, not a dialog: nothing is sent.
+            with mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate:
+                self.assertFalse(relay.respond_opencode_dismiss(
+                    "pane-1", "Dismiss", "plain working output"))
+                self.assertFalse(relay.respond_opencode_dismiss(
+                    "pane-1", "Enter", self.OPENCODE_QUESTION_SCREEN))
+                mutate.assert_not_called()
+
+    def test_opencode_dismiss_is_checked_before_the_question_path(self):
+        # "Dismiss" is not a question option label; if the dismiss check ran
+        # after respond_opencode_question it would be typed into the
+        # type-your-own input instead of escaping.
+        source = RELAY_PATH.read_text(encoding="utf-8")
+        handler = source[source.index('elif msg_type == "respond"'):]
+        self.assertLess(
+            handler.index("respond_opencode_dismiss"),
+            handler.index("respond_opencode_question"),
+        )
 
     def test_prompt_identity_ignores_multi_selection_state(self):
         with loaded_relay() as relay:

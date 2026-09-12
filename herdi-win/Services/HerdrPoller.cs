@@ -55,7 +55,9 @@ public sealed partial class HerdrPoller : IDisposable
         { "approve all pending", "configure individually", "exit (cancel subagents)" };
 
     /// <summary>
-    /// Terminal chrome that is not part of the prompt. Port of CHROME_RE (herdr_relay.py:73).
+    /// Terminal chrome that is not part of the prompt. Port of CHROME_RE (herdr_relay.py:165):
+    /// the whole Box Drawing + Block Elements ranges plus the ellipsis, so heavy
+    /// rails (┃) and half-block progress bars (╹▀▀▀) match too, not just the light set.
     ///
     /// Source-generated rather than RegexOptions.Compiled. Compiled builds the matcher with
     /// Reflection.Emit on first use, which means a dynamic assembly and a JIT pass held for
@@ -63,7 +65,7 @@ public sealed partial class HerdrPoller : IDisposable
     /// out to be blocked. The generator does the same work at build time for nothing at run
     /// time.
     /// </summary>
-    [GeneratedRegex(@"^[\s─━═_—│|◔◑◕●]+$|Kiro\s[·•]|esc to cancel|type to queue|^\s*[◔◑◕●]\s+(Shell|Bash)")]
+    [GeneratedRegex(@"^[\s\u2500-\u257F\u2580-\u259F\u2014\u2026_|\u25D4\u25D1\u25D5\u25CF]+$|Kiro\s[·•]|esc to cancel|type to queue|^\s*[◔◑◕●]\s+(Shell|Bash)")]
     private static partial Regex Chrome();
 
     private readonly SettingsStore _settings;
