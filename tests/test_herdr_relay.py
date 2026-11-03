@@ -1458,7 +1458,8 @@ class RelayQuestionTests(unittest.TestCase):
         later = self.OPENCODE_PERMISSION_SCREEN.replace("⠴", "⠸").replace("2.1s", "3.4s")
         with loaded_relay() as relay:
             first = relay.blocked_message("pane-1", "opencode", "nodehr", "local",
-                                          self.OPENCODE_PERMISSION_SCREEN)
+                                          self.OPENCODE_PERMISSION_SCREEN,
+                                          cwd="/Users/x/nodehr")
             second = relay.blocked_message("pane-1", "opencode", "nodehr", "local", later)
 
             self.assertEqual(first["options"], [*relay.OPENCODE_OPTIONS, relay.OPENCODE_DISMISS])
@@ -1467,6 +1468,13 @@ class RelayQuestionTests(unittest.TestCase):
             self.assertEqual(first["prompt"], second["prompt"])
             self.assertNotIn("⠴", first["prompt"])
             self.assertNotIn("Thought", first["prompt"])
+            # The permission card's subject: the `←` line plus its body lines.
+            self.assertEqual(first["summary"],
+                             "Access external directory ~/app/lib/core/services")
+            self.assertEqual(first["detail"],
+                             ["Patterns", "- /Users/x/app/lib/core/services/*"])
+            # Project context rides along for the card's context line.
+            self.assertEqual(first["cwd"], "/Users/x/nodehr")
 
     def test_opencode_permission_responses_are_tab_enter_keystrokes(self):
         with loaded_relay() as relay:
@@ -2107,6 +2115,7 @@ class RelayEventPushTests(unittest.IsolatedAsyncioTestCase):
                             "agent": "omp",
                             "project": "current",
                             "host": "local",
+                            "cwd": "/projects/current",
                             "prompt": "approve all pending",
                             "prompt_id": expected_prompt_id,
                             "options": relay.SUBAGENT_OPTIONS,
@@ -2129,6 +2138,145 @@ class RelayEventPushTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(relay.known_panes, expected_pane_ids)
                 self.assertEqual(relay.pane_remote_map, expected_remote_map)
                 self.assertNotIn("stale-pane", relay.last_statuses)
+
+
+class OpencodeSessionInfoTests(unittest.TestCase):
+    def _make_db(self, path):
+        import sqlite3
+        conn = sqlite3.connect(path)
+        conn.executescript("""
+            CREATE TABLE session (id text, project_id text, slug text, directory text,
+                title text, version text, time_created int, time_updated int,
+                time_archived int, cost real, tokens_input int, tokens_output int,
+                tokens_reasoning int, tokens_cache_read int, tokens_cache_write int,
+                model text, workspace_id text, path text, agent text);
+            CREATE TABLE message (id text, session_id text, time_created int,
+                time_updated int, data text);
+            CREATE TABLE todo (session_id text, content text, status text,
+                priority text, position int, time_created int, time_updated int);
+            CREATE TABLE part (id text, message_id text, session_id text,
+                time_created int, time_updated int, data text);
+        """)
+        conn.execute(
+            "INSERT INTO session VALUES ('ses_live','p','s','/w/proj','New session',"
+            "'v',100,200,NULL,1.25,0,0,0,0,0,'{\"id\":\"glm-5.3\"}',NULL,NULL,NULL)")
+        conn.execute(
+            "INSERT INTO session VALUES ('ses_old','p','s','/w/proj','Old session',"
+            "'v',50,60,NULL,0.0,0,0,0,0,0,'{}',NULL,NULL,NULL)")
+        conn.execute(
+            "INSERT INTO message VALUES ('m2','ses_live',2,2,"
+            "'{\"role\":\"assistant\",\"tokens\":{\"input\":0,\"output\":0,"
+            "\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}}}')")
+        conn.execute(
+            "INSERT INTO message VALUES ('m1','ses_live',1,1,"
+            "'{\"role\":\"assistant\",\"tokens\":{\"input\":1000,\"output\":2000,"
+            "\"reasoning\":0,\"cache\":{\"read\":216447,\"write\":0}}}')")
+        conn.executemany(
+            "INSERT INTO todo VALUES ('ses_live',?,?, 'low', ?,1,1)",
+            [("done thing", "completed", 0), ("current thing", "in_progress", 1)])
+        # Newest first: a text part, then the tool the text is talking about.
+        conn.execute(
+            "INSERT INTO part VALUES ('p3','m1','ses_live',3,3,"
+            "'{\"type\":\"text\",\"text\":\"Running gates now.\nSecond line.\"}')")
+        conn.execute(
+            "INSERT INTO part VALUES ('p2','m1','ses_live',2,2,"
+            "'{\"type\":\"tool\",\"tool\":\"bash\",\"state\":{\"status\":\"running\","
+            "\"input\":{\"command\":\"npm test\\n--watch\"}}}')")
+        conn.execute(
+            "INSERT INTO part VALUES ('p1','m1','ses_live',1,1,"
+            "'{\"type\":\"tool\",\"tool\":\"edit\",\"state\":{\"status\":\"completed\","
+            "\"input\":{\"filePath\":\"/w/proj/src/app.py\"}}}')")
+        # Two user messages; the newer text part is the retryable prompt.
+        conn.execute(
+            "INSERT INTO message VALUES ('mu1','ses_live',1,1,"
+            "'{\"role\":\"user\"}')")
+        conn.execute(
+            "INSERT INTO part VALUES ('pu1a','mu1','ses_live',1,1,"
+            "'{\"type\":\"tool\",\"tool\":\"bash\"}')")
+        conn.execute(
+            "INSERT INTO part VALUES ('pu1b','mu1','ses_live',2,2,"
+            "'{\"type\":\"text\",\"text\":\"older question\"}')")
+        conn.execute(
+            "INSERT INTO message VALUES ('mu2','ses_live',3,3,"
+            "'{\"role\":\"user\"}')")
+        conn.execute(
+            "INSERT INTO part VALUES ('pu2','mu2','ses_live',4,4,"
+            "'{\"type\":\"text\",\"text\":\"please fix the login bug\"}')")
+        conn.commit()
+        conn.close()
+
+    def test_session_info_matches_latest_session_in_directory(self):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "opencode.db")
+            self._make_db(db)
+            with loaded_relay() as relay, \
+                    mock.patch.object(relay, "OPENCODE_DB_PATH", db), \
+                    mock.patch.object(relay, "git_branch", return_value="main"):
+                info = relay.opencode_session_info("/w/proj")
+        self.assertIsNotNone(info)
+        self.assertEqual(info["session_id"], "ses_live")       # newest-updated wins
+        self.assertEqual(info["context_tokens"], 219447)       # skips the zero stream row
+        self.assertEqual(info["model_id"], "glm-5.3")
+        self.assertEqual(info["cost"], 1.25)
+        self.assertEqual([t["status"] for t in info["todos"]], ["completed", "in_progress"])
+        self.assertEqual(info["branch"], "main")
+        # The running bash tool wins over the newer text part; first line only.
+        self.assertEqual(info["activity"], "▶ Bash: npm test")
+        self.assertEqual(info["updated_ms"], 200)
+
+    def test_last_user_prompt_prefers_newest_user_text(self):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "opencode.db")
+            self._make_db(db)
+            with loaded_relay() as relay, \
+                    mock.patch.object(relay, "OPENCODE_DB_PATH", db), \
+                    mock.patch.object(relay, "git_branch", return_value=""):
+                self.assertEqual(relay.opencode_last_user_prompt("/w/proj"),
+                                 {"prompt": "please fix the login bug"})
+                self.assertIsNone(relay.opencode_last_user_prompt("/nope"))
+
+    def test_remote_session_info_parses_ssh_segments(self):
+        stdout = "\n".join([
+            "===S",
+            '[{"id":"ses_r","title":"T","time_created":1,"time_updated":2,'
+            '"cost":1.0,"model":"{\\"id\\":\\"glm-5.3\\"}"}]',
+            "===M",
+            '[{"data":"{\\"tokens\\":{\\"input\\":10,\\"output\\":5,\\"reasoning\\":0,'
+            '\\"cache\\":{\\"read\\":85}}}"}]',
+            "===T",
+            '[{"status":"pending","content":"remote task"}]',
+            "===B",
+            "feature/x",
+        ])
+        fake = mock.Mock(returncode=0, stdout=stdout)
+        with loaded_relay() as relay, \
+                mock.patch.object(relay.subprocess, "run", return_value=fake) as run:
+            info = relay.opencode_session_info_remote("/w/p", "host-mac")
+            ssh_argv = run.call_args[0][0]
+            self.assertEqual(ssh_argv[-5], "host-mac")
+            self.assertEqual(ssh_argv[-3:], ["sh", "-c", mock.ANY])
+        self.assertEqual(info["session_id"], "ses_r")
+        self.assertEqual(info["context_tokens"], 100)
+        self.assertEqual(info["model_id"], "glm-5.3")
+        self.assertEqual(info["todos"], [{"status": "pending", "content": "remote task"}])
+        self.assertEqual(info["branch"], "feature/x")
+        self.assertEqual(info["activity"], "")   # parts stay local-only for now
+
+    def test_remote_session_info_returns_none_on_ssh_failure(self):
+        fake = mock.Mock(returncode=255, stdout="")
+        with loaded_relay() as relay, \
+                mock.patch.object(relay.subprocess, "run", return_value=fake):
+            self.assertIsNone(relay.opencode_session_info_remote("/w/p", "host-mac"))
+
+    def test_unknown_directory_returns_none(self):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "opencode.db")
+            self._make_db(db)
+            with loaded_relay() as relay, mock.patch.object(relay, "OPENCODE_DB_PATH", db):
+                self.assertIsNone(relay.opencode_session_info("/nope"))
 
 
 class RelayTerminalTitleTests(unittest.TestCase):

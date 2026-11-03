@@ -751,13 +751,18 @@ print(t[0]["name"] if t else "")
                             if [[ "$TUNNEL_PICK" =~ ^[0-9]+$ ]]; then
                                 TUNNEL_NAME=$(echo "$TUNNEL_LIST" | PICK="$TUNNEL_PICK" python3 -c '
 import sys, json, os
-tunnels = json.loads(sys.stdin.read())
+raw = sys.stdin.read()
+try:
+    # cloudflared can print warning lines before the JSON; parse from the first "[".
+    tunnels = json.loads(raw[raw.index("["):])
+except Exception:
+    tunnels = []
 idx = int(os.environ["PICK"]) - 1
 print(tunnels[idx]["name"] if 0 <= idx < len(tunnels) else "")
 ' 2>/dev/null)
                                 if [ -z "$TUNNEL_NAME" ]; then
                                     echo "  Invalid selection."
-                                    TUNNEL_NAME="$TUNNEL_PICK"
+                                    TUNNEL_NAME=""
                                 else
                                     echo "  Selected: $TUNNEL_NAME"
                                 fi

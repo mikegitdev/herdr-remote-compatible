@@ -86,10 +86,110 @@ class TelegramQuestionTests(unittest.TestCase):
         markup = bot.sent[0]["reply_markup"]
         self.assertEqual(
             [button.text for row in markup.inline_keyboard for button in row],
-            ["Open output & reply"],
+            ["👁 Details", "💬 Reply"],
         )
         self.assertIn("web terminal or manual terminal controls", bot.sent[0]["text"])
         self.assertEqual(telegram.pending[(1, 42)], "pane-1")
+
+
+class TelegramApprovalCardTests(unittest.TestCase):
+    def _notify(self, telegram, bot, **overrides):
+        kwargs = dict(
+            pane_id="pane-1", agent="opencode", project="checkwiseweb",
+            prompt="raw terminal tail", options=["Allow once", "Allow always", "Reject", "Dismiss"],
+            prompt_id="pid-1", interaction="opencode_permission", host="work-mac",
+            cwd="/Users/dmonster/saas/checkwiseweb",
+            summary="Bash command npm run build", detail=["$ npm run build"],
+        )
+        kwargs.update(overrides)
+        asyncio.run(telegram.notify_blocked(types.SimpleNamespace(bot=bot), **kwargs))
+
+    def test_permission_notification_is_compact_card(self):
+        telegram = loaded_telegram()
+        telegram.CHAT_ID = "1"
+        bot = _Bot()
+        self._notify(telegram, bot)
+
+        sent = bot.sent[0]
+        self.assertEqual(sent["parse_mode"], "HTML")
+        text = sent["text"]
+        self.assertIn("🔐 <b>Approval</b> · <b>checkwiseweb</b> · work-mac", text)
+        self.assertIn("<code>~/saas/checkwiseweb</code>", text)
+        self.assertIn("🟢 Bash command", text)
+        self.assertIn("Target\n<code>npm run build</code>", text)
+        self.assertNotIn("Patterns", text)
+        self.assertIn("⏳ Waiting", text)
+        self.assertNotIn("Use an approval button", text)
+        self.assertNotIn("```", text)
+
+        rows = sent["reply_markup"].inline_keyboard
+        self.assertEqual([button.text for button in rows[0]], ["✅ Allow once"])
+        self.assertEqual([button.text for button in rows[1]], ["♾ Allow always", "📁 Trust project"])
+        self.assertEqual([button.text for button in rows[2]], ["❌ Reject", "👁 Details", "💬 Reply"])
+        self.assertEqual(
+            telegram.parse_callback_data(rows[0][0].callback_data)["action"], "approve")
+        self.assertEqual(telegram.approval_messages["pane-1"]["project"], "checkwiseweb")
+
+    def test_directory_permission_renders_target_and_patterns(self):
+        telegram = loaded_telegram()
+        telegram.CHAT_ID = "1"
+        bot = _Bot()
+        self._notify(
+            telegram, bot,
+            summary="Access external directory ~/saas/nodehr",
+            detail=["Patterns", "- /Users/dmonster/saas/nodehr/*",
+                    "- /var/folders/xx/opencode/nodehr-head/apps/*"],
+        )
+        text = bot.sent[0]["text"]
+        self.assertIn("🟡 External directory access", text)
+        self.assertIn("Target\n<code>~/saas/nodehr</code>", text)
+        self.assertIn("Patterns", text)
+        self.assertIn("• <code>~/saas/nodehr/*</code>", text)
+        self.assertIn("• <code>/var/folders/xx/opencode/nodehr-head/apps/*</code>", text)
+
+    def test_dangerous_subject_gets_red_severity(self):
+        telegram = loaded_telegram()
+        telegram.CHAT_ID = "1"
+        bot = _Bot()
+        self._notify(telegram, bot, summary="Bash command clean build dir",
+                     detail=["$ rm -rf build"])
+        self.assertIn("🔴 Bash command", bot.sent[0]["text"])
+
+    def test_matched_rule_auto_allows_without_notifying(self):
+        telegram = loaded_telegram()
+        telegram.CHAT_ID = "1"
+        bot = _Bot()
+        rules = [{"project": "checkwiseweb", "subject": "npm run build"}]
+        with mock.patch.object(telegram.approval_rules, "load", return_value=rules), \
+                mock.patch.object(telegram, "send_to_relay", mock.AsyncMock()) as respond:
+            asyncio.run(telegram.notify_blocked_safely(types.SimpleNamespace(bot=bot), {
+                "type": "blocked", "pane_id": "pane-1", "agent": "opencode",
+                "project": "checkwiseweb", "prompt": "...",
+                "options": ["Allow once"], "prompt_id": "pid-1",
+                "interaction": "opencode_permission",
+                "summary": "Bash command npm run build", "detail": ["$ npm run build"],
+            }))
+        respond.assert_awaited_once_with("pane-1", "Allow once", prompt_id="pid-1")
+        self.assertEqual(bot.sent, [])
+
+    def test_dangerous_subject_never_auto_approves(self):
+        telegram = loaded_telegram()
+        telegram.CHAT_ID = "1"
+        bot = _Bot()
+        rules = [{"project": "checkwiseweb", "subject": "rm"}]
+        with mock.patch.object(telegram.approval_rules, "load", return_value=rules):
+            self._notify_rule_check(telegram, bot)
+        self.assertEqual(len(bot.sent), 1)
+
+    def _notify_rule_check(self, telegram, bot):
+        with mock.patch.object(telegram, "send_to_relay", mock.AsyncMock()):
+            asyncio.run(telegram.notify_blocked_safely(types.SimpleNamespace(bot=bot), {
+                "type": "blocked", "pane_id": "pane-1", "agent": "opencode",
+                "project": "checkwiseweb", "prompt": "...",
+                "options": ["Allow once"], "prompt_id": "pid-1",
+                "interaction": "opencode_permission",
+                "summary": "Bash command clean", "detail": ["$ rm -rf build"],
+            }))
 
 
 if __name__ == "__main__":

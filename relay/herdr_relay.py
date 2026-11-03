@@ -168,13 +168,33 @@ CHROME_RE = re.compile(
     r"|esc to cancel"
     r"|type to queue"
     r"|^\s*[\u25d4\u25d1\u25d5\u25cf]\s+(Shell|Bash)"
+    # pi's TUI chrome: the questionnaire hint row (kept once Ctrl+U marks the
+    # open text input, which custom_editor_active keys on), the token/cost
+    # footer, the MCP line, the spinner divider, and the herdr widget's
+    # sibling-agent header and rows. All carry text, so the first branch
+    # never catches them.
+    r"|Enter to select(?![^\r\n]*Ctrl\+U)"
+    r"|\u2191\d[\d.,]*[kMG]?\s+\u2193\d"
+    r"|MCP:\s*\d+ servers? enabled"
+    r"|Herdr \u00b7 \d+ sibling"
+    r"|^\s*[\u25cb\u25cf\u25d0-\u25d3]\s+(working|idle|blocked|done)\s"
+    r"|^\s*\u2500+\s*[\u2800-\u28ff]\s"
 )
 QUESTION_OPTION_RE = re.compile(
     r"^(?P<cursor>[\uf054>\u203a\u276f\u25b8\u2192])?\s*"
+    r"(?:"
+    # omp marks each option with a checkbox/radio/marker glyph ...
     r"(?P<marker>[\uf046\uf10c\uf192\uf096\uf14a\u25cb\u25c9\u2610\u2611]|\([ o]\)|\[[ xX]\])\s+"
+    # ... while pi numbers them (`❯ 1. Option A`, cursor on the selected row).
+    r"|(?P<num>\d{1,2})\.\s+"
+    r")"
     r"(?P<label>.+?)\s*$"
 )
 QUESTION_OTHER = "Other (type your own)"
+# pi's questionnaire appends its free-text row as `N. Type something.`; the
+# numbered form has no marker, so the only guard against an ordinary numbered
+# list in the terminal is this exact label sitting in the same block.
+QUESTION_OTHER_PI = "Type something."
 
 
 clients = set()
@@ -1453,7 +1473,18 @@ def read_pane(pane_id, remote=None):
     lines = [l for l in raw.splitlines() if l.strip() and not CHROME_RE.search(l)]
     display_lines = lines[-50:]
     question = detect_question("\n".join(lines))
-    if question and question["text"] and question["text"] not in display_lines:
+    # The insert exists for omp: its boxed dialog can push the question text far
+    # above the option rows, out of the tail a prompt carries. pi's questionnaire
+    # keeps the question directly on top of its options, and its interleaved
+    # option descriptions would make the backward walk below land mid-block --
+    # splitting the options the next detect_question sees. Skip the insert there.
+    pi_block = question and any(
+        option["label"] == QUESTION_OTHER_PI for option in question["options"]
+    )
+    if (
+        question and question["text"] and question["text"] not in display_lines
+        and not pi_block
+    ):
         option_start = next(
             (
                 index for index in range(len(display_lines) - 1, -1, -1)
@@ -1482,6 +1513,15 @@ def detect_question(text):
         match = QUESTION_OPTION_RE.match(line)
         if not match:
             if current:
+                # An indented non-matching line between matching ones is a
+                # pi option's description ("     Proceed with option A ...")
+                # and belongs to the block; anything else closes it.
+                next_line = (
+                    lines[line_index + 1].strip().strip("\u2502|").strip()
+                    if line_index + 1 < len(lines) else ""
+                )
+                if line and raw_line[:1].isspace() and QUESTION_OPTION_RE.match(next_line):
+                    continue
                 blocks.append((current_start, current))
                 current = []
                 current_start = None
@@ -1499,11 +1539,21 @@ def detect_question(text):
         blocks.append((current_start, current))
 
     for block_start, block in reversed(blocks):
-        has_other = any(option["label"] == QUESTION_OTHER for option in block)
+        has_other = any(
+            option["label"] in (QUESTION_OTHER, QUESTION_OTHER_PI) for option in block
+        )
         has_done = any("Done selecting" in option["label"] for option in block)
         if has_other or has_done:
             question_lines = []
+            # pi's numbered questionnaire sits directly under its one-line
+            # question (and optional one-line header); read_pane drops blank
+            # lines, so an uncapped walk would swallow the whole visible
+            # conversation above the dialog. omp questions may be long
+            # (test_prompt_identity depends on it) and stay uncapped.
+            pi_block = any(option["label"] == QUESTION_OTHER_PI for option in block)
             for raw_line in reversed(lines[:block_start]):
+                if pi_block and len(question_lines) >= 3:
+                    break
                 line = raw_line.strip().strip("\u2502|").strip()
                 if not line:
                     if question_lines:
@@ -1552,13 +1602,18 @@ def detect_options(text):
     return [
         option["label"]
         for option in question["options"]
-        if option["label"] != QUESTION_OTHER and "Done selecting" not in option["label"]
+        if option["label"] not in (QUESTION_OTHER, QUESTION_OTHER_PI)
+        and "Done selecting" not in option["label"]
     ]
 
 
 def custom_editor_active(text):
-    return "Enter your response:" in text or (
-        "Custom answer:" in text and "submit" in text.lower()
+    return (
+        "Enter your response:" in text
+        # pi's inline answer input: the questionnaire hint grows a
+        # `Ctrl+U to clear` tail only while that input has focus.
+        or "Ctrl+U to clear" in text
+        or ("Custom answer:" in text and "submit" in text.lower())
     )
 
 # Lines that keep changing while a prompt sits waiting -- the braille spinner cycles per
@@ -1602,8 +1657,44 @@ def prompt_matches(pane_id, prompt_id, remote=None):
     return question_prompt_id(pane_id, read_pane(pane_id, remote=remote)) == prompt_id
 
 
-def blocked_message(pane_id, agent, project, host, content):
-    question = detect_question(content) if agent == "omp" else None
+def extract_permission_detail(text):
+    """The `← ...` summary and body lines of an OpenCode permission dialog.
+
+    Whatever OpenCode puts between the `Permission required` title and the
+    Allow/Reject button row is the payload: for bash it is the command, for
+    file access a Patterns list. Returns (summary, [detail lines]) or None.
+    """
+    summary = None
+    detail = []
+    in_dialog = False
+    for raw in text.splitlines():
+        line = raw.strip().strip("┃│").strip()
+        if not line:
+            continue
+        if "Permission required" in line:
+            in_dialog = True
+            continue
+        if not in_dialog:
+            continue
+        # The button row ends the dialog.
+        if "allow always" in line.lower() or "⇆ select" in line:
+            break
+        if line.startswith("←"):
+            if summary is None:
+                summary = line.lstrip("← ").strip()
+                continue
+        elif line.startswith("△") or line.startswith("⏎"):
+            line = line.lstrip("△⏎ ").strip()
+        detail.append(line)
+        if len(detail) >= 8 or len(" ".join(detail)) > 400:
+            break
+    if summary is None:
+        return None
+    return summary, detail
+
+
+def blocked_message(pane_id, agent, project, host, content, cwd=""):
+    question = detect_question(content) if agent in ("omp", "pi") else None
     oc_question = detect_opencode_question(content) if agent == "opencode" else None
     oc_review = (
         detect_opencode_review(content)
@@ -1621,18 +1712,19 @@ def blocked_message(pane_id, agent, project, host, content):
     elif oc_permission:
         options = OPENCODE_OPTIONS
     else:
-        options = detect_options(content) if agent == "omp" else detect_approval_options(content)
+        options = detect_options(content) if agent in ("omp", "pi") else detect_approval_options(content)
     if oc_question is not None or oc_review or oc_permission:
         # Every opencode dialog takes an Esc; carrying it in `options` means the
         # web client gets the button from the same message Telegram does.
         options = [*options, OPENCODE_DISMISS]
     stable = stable_pane_text(content)
-    return {
+    message = {
         "type": "blocked",
         "pane_id": pane_id,
         "agent": agent,
         "project": project,
         "host": host,
+        "cwd": cwd,
         "prompt": stable[-500:],
         "prompt_id": question_prompt_id(pane_id, content),
         "options": [] if question and question["multi"] else options,
@@ -1652,11 +1744,243 @@ def blocked_message(pane_id, agent, project, host, content):
         "multi": bool(question and question["multi"]),
         "update": False,
     }
+    if oc_permission:
+        extracted = extract_permission_detail(content)
+        if extracted:
+            message["summary"], message["detail"] = extracted
+    return message
+
+
+OPENCODE_DB_PATH = os.environ.get(
+    "HERDR_OPENCODE_DB",
+    os.path.expanduser("~/.local/share/opencode/opencode.db"),
+)
+
+
+def git_branch(cwd: str) -> str:
+    """Current branch of a working copy, '' when not a repo (or git says so)."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", cwd, "branch", "--show-current"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        return out or ""
+    except Exception:
+        return ""
+
+
+TOOL_LABELS = {"bash": "Bash", "edit": "Edit", "write": "Write", "read": "Read"}
+
+
+def _context_from_messages(message_rows):
+    """Current context = the newest message that carries tokens (the very
+    latest rows are streams still at zero)."""
+    context = 0
+    for data in message_rows:
+        try:
+            tokens = (json.loads(data) or {}).get("tokens") or {}
+        except ValueError:
+            continue
+        context = (tokens.get("input") or 0) + (tokens.get("output") or 0) \
+            + (tokens.get("reasoning") or 0) + ((tokens.get("cache") or {}).get("read") or 0)
+        if context:
+            return context
+    return context
+
+
+def _activity_from_parts(part_rows):
+    """Newest tool part wins; the newest text part is the fallback."""
+    activity, tool_activity = "", ""
+    for data in part_rows:
+        try:
+            part = json.loads(data)
+        except ValueError:
+            continue
+        if part.get("type") == "tool" and not tool_activity:
+            state = part.get("state") or {}
+            inp = state.get("input") or {}
+            label = TOOL_LABELS.get(part.get("tool") or "") or \
+                (part.get("tool") or "tool").split("_")[-1].capitalize()
+            target = inp.get("command") or inp.get("filePath") or ""
+            if target:
+                target = target.splitlines()[0][:60]
+                if part.get("tool") != "bash":
+                    target = os.path.basename(target)
+                tool_activity = f"{label}: {target}"
+            else:
+                tool_activity = label
+            if state.get("status") == "running":
+                tool_activity = f"▶ {tool_activity}"
+        elif not activity and part.get("type") == "text" and part.get("text"):
+            activity = (part["text"] or "").strip().splitlines()[0][:80]
+    return tool_activity or activity
+
+
+def _session_payload(session_row, message_rows, todo_rows, part_rows, branch):
+    session_id, title, created, updated, cost, model_json = session_row
+    todos = [{"status": row["status"], "content": row["content"]} for row in todo_rows]
+    try:
+        model_id = (json.loads(model_json) or {}).get("id", "")
+    except ValueError:
+        model_id = ""
+    return {
+        "session_id": session_id,
+        "title": title,
+        "created_ms": created,
+        "updated_ms": updated,
+        "cost": cost,
+        "model_id": model_id,
+        "context_tokens": _context_from_messages(message_rows),
+        "todos": todos,
+        "activity": _activity_from_parts(part_rows),
+        "branch": branch,
+    }
+
+
+def opencode_session_info(cwd: str):
+    """Live session details for an opencode pane, from opencode's own SQLite DB.
+
+    ponytail: matched by directory + latest-updated, the only join herdr's pane
+    list offers — two opencode panes in one directory both see the newer session.
+    Revisit when opencode exposes a session id herdr can carry.
+    """
+    import sqlite3
+    try:
+        conn = sqlite3.connect(f"file:{OPENCODE_DB_PATH}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT id, title, time_created, time_updated, cost, model FROM session "
+            "WHERE directory = ? AND time_archived IS NULL "
+            "ORDER BY time_updated DESC LIMIT 1",
+            (cwd,),
+        ).fetchone()
+        if not row:
+            return None
+        sub = "(SELECT id FROM session WHERE directory = ? AND time_archived IS NULL " \
+              "ORDER BY time_updated DESC LIMIT 1)"
+        message_rows = [r[0] for r in conn.execute(
+            f"SELECT data FROM message WHERE session_id = {sub} "
+            "ORDER BY time_created DESC LIMIT 8", (cwd,))]
+        todo_rows = [
+            {"status": status, "content": content}
+            for status, content in conn.execute(
+                f"SELECT status, content FROM todo WHERE session_id = {sub} "
+                "ORDER BY position", (cwd,))
+        ]
+        part_rows = [r[0] for r in conn.execute(
+            f"SELECT data FROM part WHERE session_id = {sub} "
+            "ORDER BY time_updated DESC LIMIT 10", (cwd,))]
+        return _session_payload(row, message_rows, todo_rows, part_rows, git_branch(cwd))
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+def opencode_session_info_remote(cwd: str, remote: str):
+    """Session details from a remote host's opencode.db, over one ssh trip.
+
+    ponytail: sh + sqlite3 -json on the far side (macOS ships both); activity
+    needs part JSON across a shell, so it stays local-only until a remote
+    wants it. Untested against a real remote host.
+    """
+    safe = cwd.replace("'", "''")
+    latest = f"(SELECT id FROM session WHERE directory='{safe}' AND time_archived IS NULL " \
+             "ORDER BY time_updated DESC LIMIT 1)"
+    script = "\n".join([
+        'DB="$HOME/.local/share/opencode/opencode.db"',
+        '[ -f "$DB" ] || exit 0',
+        "echo ===S",
+        f'sqlite3 -readonly -json "$DB" "SELECT id,title,time_created,time_updated,cost,model '
+        f"FROM session WHERE directory='{safe}' AND time_archived IS NULL "
+        'ORDER BY time_updated DESC LIMIT 1"',
+        "echo ===M",
+        f'sqlite3 -readonly -json "$DB" "SELECT data FROM message WHERE session_id={latest} '
+        'ORDER BY time_created DESC LIMIT 8"',
+        "echo ===T",
+        f'sqlite3 -readonly -json "$DB" "SELECT status,content FROM todo WHERE session_id={latest} '
+        'ORDER BY position"',
+        "echo ===B",
+        f'git -C "{safe}" branch --show-current 2>/dev/null || true',
+    ])
+    try:
+        result = subprocess.run(
+            [*SSH_BASE_ARGS, remote, "--", "sh", "-c", script],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    segments = {}
+    marker = None
+    for line in result.stdout.splitlines():
+        if line.startswith("===") and len(line) == 4:
+            marker = line[3:]
+            segments[marker] = []
+        elif marker:
+            segments[marker].append(line)
+    try:
+        session_rows = json.loads("\n".join(segments.get("S") or []) or "[]")
+        message_rows = [row["data"] for row in json.loads(
+            "\n".join(segments.get("M") or []) or "[]")]
+        todo_rows = json.loads("\n".join(segments.get("T") or []) or "[]")
+    except ValueError:
+        return None
+    if not session_rows:
+        return None
+    row = session_rows[0]
+    session_row = (row["id"], row["title"], row["time_created"],
+                   row["time_updated"], row["cost"], row.get("model") or "{}")
+    branch = "\n".join(segments.get("B") or []).strip()
+    return _session_payload(session_row, message_rows, todo_rows, [], branch)
+
+
+def opencode_last_user_prompt(cwd: str):
+    """The session's newest user-typed prompt, for the Retry button."""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(f"file:{OPENCODE_DB_PATH}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT id FROM session WHERE directory = ? AND time_archived IS NULL "
+            "ORDER BY time_updated DESC LIMIT 1",
+            (cwd,),
+        ).fetchone()
+        if not row:
+            return None
+        part = conn.execute(
+            "SELECT p.data FROM part p JOIN message m ON p.message_id = m.id "
+            "WHERE p.session_id = ? AND json_extract(m.data, '$.role') = 'user' "
+            "AND json_extract(p.data, '$.type') = 'text' "
+            "ORDER BY p.time_created DESC LIMIT 1",
+            (row[0],),
+        ).fetchone()
+        if not part:
+            return None
+        try:
+            text = (json.loads(part[0]) or {}).get("text") or ""
+        except ValueError:
+            return None
+        text = text.strip()
+        return {"prompt": text[:2000]} if text else None
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
 
 
 def pane_is_omp(pane_id, remote=None):
+    """Whether the pane's agent answers on-screen options with Up/Down/Enter
+    navigation: omp's marker rows and pi's numbered questionnaire rows take the
+    same keystrokes, so one responder serves both."""
     return any(
-        agent["pane_id"] == pane_id and agent["agent"] == "omp" and agent.get("remote") == remote
+        agent["pane_id"] == pane_id and agent["agent"] in ("omp", "pi")
+        and agent.get("remote") == remote
         for agent in get_all_agents()
     )
 
@@ -1841,7 +2165,8 @@ def respond_to_question(pane_id, text, question, remote=None):
     custom_response = target_index is None
     if custom_response:
         target_index = next(
-            (index for index, option in enumerate(options) if option["label"] == QUESTION_OTHER),
+            (index for index, option in enumerate(options)
+             if option["label"] in (QUESTION_OTHER, QUESTION_OTHER_PI)),
             None,
         )
     if target_index is None:
@@ -1857,9 +2182,7 @@ def respond_to_question(pane_id, text, question, remote=None):
     deadline = time.monotonic() + 1.5
     while time.monotonic() < deadline:
         editor_content = read_pane(pane_id, remote=remote)
-        if "Enter your response:" in editor_content or (
-            "Custom answer:" in editor_content and "submit" in editor_content.lower()
-        ):
+        if custom_editor_active(editor_content):
             break
         time.sleep(0.05)
     else:
@@ -1896,13 +2219,17 @@ async def send_current_snapshot(ws):
         if agent["status"] != "blocked":
             continue
         content = await asyncio.to_thread(read_pane, agent["pane_id"], remote=agent.get("remote"))
-        await ws.send(json.dumps(blocked_message(
+        preamble_message = blocked_message(
             agent["pane_id"],
             agent["agent"],
             agent["project"],
             agent.get("host", "local"),
             content,
-        )))
+            cwd=agent.get("cwd", ""),
+        )
+        preamble_message["branch"] = await asyncio.to_thread(
+            git_branch, agent.get("cwd", "")) if agent.get("cwd") else ""
+        await ws.send(json.dumps(preamble_message))
 
 
 async def poll_loop():
@@ -1938,6 +2265,7 @@ async def _poll_once():
                     a["project"],
                     a.get("host", "local"),
                     content,
+                    cwd=a.get("cwd", ""),
                 )
                 fingerprint = (
                     message["prompt_id"],
@@ -1947,6 +2275,10 @@ async def _poll_once():
                 previous = last_blocked_prompts.get(pid)
                 if previous != fingerprint:
                     message["update"] = previous is not None and previous[0] == message["prompt_id"]
+                    # Only the broadcast needs the branch (a git call); the
+                    # fingerprint comparison runs every poll and must not.
+                    message["branch"] = await asyncio.to_thread(
+                        git_branch, a.get("cwd", "")) if a.get("cwd") else ""
                     last_blocked_prompts[pid] = fingerprint
                     await broadcast(message)
                     await send_web_push(
@@ -2016,6 +2348,7 @@ async def event_push():
                 agent_data.get("project", ""),
                 host,
                 content or agent_data.get("prompt", "Agent is blocked"),
+                cwd=agent_data.get("cwd", ""),
             )
             # Unreachable with a mismatch today: whichever branch got here
             # did so with no await since the last gen check (the "agents"
@@ -2452,6 +2785,43 @@ async def handle_client(ws):
                         pane_process, pane_id, remote=remote
                     )
                 await ws.send(json.dumps(reply))
+            elif msg_type == "session_info":
+                pane_id = msg["pane_id"]
+                if pane_id not in known_panes:
+                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                    continue
+                remote = pane_remote_map.get(pane_id)
+                info = None
+                agents_snapshot = await asyncio.to_thread(get_all_agents)
+                agent = next(
+                    (a for a in agents_snapshot if a.get("pane_id") == pane_id), None
+                )
+                if agent and agent.get("agent") == "opencode" and agent.get("cwd"):
+                    if remote is None:
+                        info = await asyncio.to_thread(
+                            opencode_session_info, agent["cwd"])
+                    else:
+                        info = await asyncio.to_thread(
+                            opencode_session_info_remote, agent["cwd"], remote)
+                await ws.send(json.dumps(
+                    {"type": "session_info", "pane_id": pane_id, "info": info}))
+            elif msg_type == "last_prompt":
+                pane_id = msg["pane_id"]
+                if pane_id not in known_panes:
+                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                    continue
+                remote = pane_remote_map.get(pane_id)
+                prompt = None
+                if remote is None:
+                    agents_snapshot = await asyncio.to_thread(get_all_agents)
+                    agent = next(
+                        (a for a in agents_snapshot if a.get("pane_id") == pane_id), None
+                    )
+                    if agent and agent.get("agent") == "opencode" and agent.get("cwd"):
+                        prompt = await asyncio.to_thread(
+                            opencode_last_user_prompt, agent["cwd"])
+                await ws.send(json.dumps(
+                    {"type": "last_prompt", "pane_id": pane_id, "prompt": prompt}))
             elif msg_type == "get_history":
                 pane_id = msg["pane_id"]
                 if pane_id not in known_panes:

@@ -11,6 +11,7 @@ from telegram import ForceReply, Update, InlineKeyboardButton, InlineKeyboardMar
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, ContextTypes, filters
 
 from agent_state import apply_agent_message
+import approval_rules
 
 logging.basicConfig(level=logging.INFO)
 # httpx logs every request URL at INFO; that URL contains the bot token. Silence it.
@@ -44,6 +45,63 @@ if not TOKEN:
 pending: OrderedDict[tuple[int, int], str] = OrderedDict()  # (chat_id, message_id) -> pane_id
 approval_tokens: dict[str, str] = {}  # pane_id -> current blocked-notification generation
 blocked_prompt_ids: dict[str, str] = {}  # pane_id -> current relay prompt identity
+# pane_id -> the live approval message we must edit (not re-notify) when it closes
+approval_messages: dict[str, dict] = {}
+# How many times you manually allowed the same subject before we offer a rule
+RULE_OFFER_AFTER = 3
+manual_approvals: Counter = Counter()  # (project, subject) -> manual allow count
+rule_offers: dict[str, dict] = {}      # pane_id -> {project, subject, text} while the save button lives
+# finish -> restart within this window reuses the same card (opencode flaps
+# working/idle between turns; each flap must not become a new ping)
+FLAP_GRACE = 30
+# an opencode session with no DB updates for this long while "working" is suspect
+STUCK_AFTER = 600
+# one follow-up ping after an approval card sits unanswered this long
+NUDGE_AFTER = 300
+
+# --- Quiet projects: cards still arrive, but silently (no ping) ---
+
+QUIET_PATH = os.path.join(
+    os.path.expanduser("~"), ".config", "herdr-remote", "quiet_projects.json")
+
+
+def load_quiet() -> list:
+    try:
+        with open(QUIET_PATH, encoding="utf-8") as fh:
+            quiet = json.load(fh)
+        return quiet if isinstance(quiet, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_quiet(quiet: list):
+    os.makedirs(os.path.dirname(QUIET_PATH), exist_ok=True)
+    with open(QUIET_PATH, "w", encoding="utf-8") as fh:
+        json.dump(sorted(quiet), fh, indent=2)
+
+
+def is_quiet(project: str) -> bool:
+    return project in load_quiet()
+
+
+# Public web dashboard base (deep-link buttons); '' disables them. Read from the
+# shared config so the bot service needs no new env plumbing.
+def _web_base() -> str:
+    hostname = os.environ.get("HERDR_TUNNEL_HOSTNAME", "")
+    if not hostname:
+        try:
+            with open(os.path.expanduser(
+                    "~/.config/herdr-remote/config.env"), encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("HERDR_TUNNEL_HOSTNAME="):
+                        hostname = line.split("=", 1)[1].strip()
+                        break
+        except OSError:
+            pass
+    return f"https://{hostname}" if hostname else ""
+# pane_id -> the live session card: created on start, edited in place while
+# working, edited into the finished card at the end. One message per session.
+working_cards: dict[str, dict] = {}
 agents: list[dict] = []       # current agent list from relay
 prev_statuses: dict[str, str] = {}  # pane_id -> last known status
 relay_connected = False
@@ -62,6 +120,14 @@ CHROME_RE = re.compile(
     r"|esc to cancel"
     r"|type to queue"
     r"|^\s*[\u25d4\u25d1\u25d5\u25cf]\s+(Shell|Bash)"
+    # pi's TUI chrome, ported with CHROME_RE: questionnaire hint row, token/cost
+    # footer, MCP line, spinner divider, herdr widget sibling header/rows.
+    r"|Enter to select"
+    r"|\u2191\d[\d.,]*[kMG]?\s+\u2193\d"
+    r"|MCP:\s*\d+ servers? enabled"
+    r"|Herdr \u00b7 \d+ sibling"
+    r"|^\s*[\u25cb\u25cf\u25d0-\u25d3]\s+(working|idle|blocked|done)\s"
+    r"|^\s*\u2500+\s*[\u2800-\u28ff]\s"
 )
 # OpenCode's inline TUI marks structure on text lines: a `┃`/`│` rail prefixes
 # user input and tool blocks (the agent's own reply is plain unrailled text),
@@ -73,6 +139,18 @@ TUI_MARK_RE = re.compile(
     r"|^\s*\u2699"
     r"|^\s*\$ "
     r"|ctrl\+p"
+    r"|shift\+tab"
+)
+# Claude Code's own chrome that carries text, so the two regexes above keep it:
+# the block-letter banner, the ✻ status/timer line, the upgrade notice, and a
+# bare prompt. What is left of the tail is the actual exchange: `❯ input`,
+# `⏺ reply`, `⎿ result`.
+CLAUDE_NOISE_RE = re.compile(
+    r"^\s*[\u2580-\u259f]{2,}\s"          # banner rows: "▐▛███▛█ Claude Code v…", "▝▝   ▝▝   ~/…"
+    r"|^\s*[\u273b\u273d\u273c\u2736]\s"    # "✻ Cooked for 4s · done 4:18 PM"
+    r"|^\s*❯\s*$"                        # empty prompt
+    r"|^\s*Update available"             # "Update available! Run: brew upgrade claude-code"
+    r"|Allow rule\b.*allows any option"  # settings-lint warnings printed at startup
 )
 STATUS_ORDER = {"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 3}
 STATUS_LABELS = {"blocked": "BLOCKED", "working": "WORKING", "done": "DONE", "idle": "IDLE", "unknown": "IDLE"}
@@ -83,6 +161,13 @@ ACTION_CODES = {
     "select_reply": "q",
     "trust": "t",
     "approval": "k",
+    "approve": "o",
+    "always": "y",
+    "trust_project": "j",
+    "reject": "x",
+    "reply": "e",
+    "save_rule": "v",
+    "retry": "z",
 }
 CODE_ACTIONS = {code: action for action, code in ACTION_CODES.items()}
 
@@ -174,10 +259,84 @@ async def read_pane(pane_id: str, lines: int = 100) -> str:
                         if stripped
                         and not CHROME_RE.search(stripped)
                         and not TUI_MARK_RE.search(stripped)
+                        and not CLAUDE_NOISE_RE.search(stripped)
                     ]
                     return "\n".join(kept[-50:]) if kept else "(no output)"
     except Exception as e:
         return f"(error reading pane: {scrub(e)})"
+
+
+async def fetch_session_info(pane_id: str) -> dict | None:
+    """Session details (context, cost, todos) from the relay, if the pane has any."""
+    import websockets
+    try:
+        async with websockets.connect(RELAY_WS) as ws:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + PANE_READ_TIMEOUT
+            await ws.send(json.dumps({"type": "session_info", "pane_id": pane_id}))
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return None
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                msg = json.loads(raw)
+                if msg.get("type") == "session_info":
+                    return msg.get("info")
+    except Exception as e:
+        log.warning("Failed to read session info: %s", scrub(e))
+        return None
+
+
+async def fetch_last_prompt(pane_id: str) -> dict | None:
+    """The pane's last user prompt (for Retry), via the relay."""
+    import websockets
+    try:
+        async with websockets.connect(RELAY_WS) as ws:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + PANE_READ_TIMEOUT
+            await ws.send(json.dumps({"type": "last_prompt", "pane_id": pane_id}))
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return None
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                msg = json.loads(raw)
+                if msg.get("type") == "last_prompt":
+                    return msg.get("prompt")
+    except Exception as e:
+        log.warning("Failed to read last prompt: %s", scrub(e))
+        return None
+
+
+# ponytail: model->window map for the "22% used" line; unknown models show tokens only.
+MODEL_CONTEXT_WINDOWS = {"glm-5.3": 1_000_000}
+
+TODO_MARKS = {"in_progress": "[•]", "completed": "[x]", "pending": "[ ]"}
+
+
+def session_details_lines(info: dict | None) -> list[str]:
+    if not info:
+        return []
+    lines = []
+    context = info.get("context_tokens") or 0
+    if context:
+        window = MODEL_CONTEXT_WINDOWS.get(info.get("model_id") or "")
+        pct = f" · {round(context * 100 / window)}%" if window else ""
+        import time
+        since = time.strftime("%H:%M", time.localtime((info.get("created_ms") or 0) / 1000))
+        lines.append(f"Context: {context:,} tokens{pct}")
+        lines.append(f"${(info.get('cost') or 0):.2f} · since {since}")
+    todos = [t for t in info.get("todos") or [] if t.get("status") != "cancelled"]
+    if todos:
+        done = sum(t.get("status") == "completed" for t in todos)
+        lines += ["", f"Todo {done}/{len(todos)}"]
+        lines += [
+            f"{TODO_MARKS.get(t.get('status'), '[ ]')} {html.escape((t.get('content') or '')[:80])}"
+            for t in todos[:6]
+        ]
+        if len(todos) > 6:
+            lines.append(f"+{len(todos) - 6} more")
+    return lines
 
 
 async def fetch_sessions() -> list[dict] | None:
@@ -260,11 +419,17 @@ def clear_relay_connection_state():
     agents = []
     approval_tokens.clear()
     blocked_prompt_ids.clear()
+    approval_messages.clear()
+    working_cards.clear()
 
 
 async def send_reply_prompt(message, chat, agent: dict, content: str | None = None):
-    parts = [pane_content_message(agent, content or "", limit=3000), "",
-             "Reply to this message to send your response."]
+    if content is None:
+        target = agent.get("project") or agent.get("agent") or "the agent"
+        parts = [f"💬 Reply to this message to answer {target}."]
+    else:
+        parts = [pane_content_message(agent, content, limit=3000), "",
+                 "Reply to this message to send your response."]
     kwargs = {}
     if getattr(chat, "type", None) == "private":
         kwargs["reply_markup"] = ForceReply(
@@ -499,6 +664,70 @@ async def cmd_agents(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /now — one card per active session, on demand."""
+    if not authorized(update):
+        return
+    if not relay_connected:
+        await update.message.reply_text("Not connected to relay. Use /start after it reconnects.")
+        return
+    import time
+    active = [a for a in agents if a.get("status") in ("working", "blocked")]
+    if not active:
+        await update.message.reply_text("No active sessions.")
+        return
+    for agent in sorted_agents(active):
+        started = daily_stats.get(agent["pane_id"], {}).get("last_change")
+        elapsed = time.time() - started if started else 0
+        state = "paused" if agent.get("status") == "blocked" else "working"
+        info = await fetch_session_info(agent["pane_id"])
+        activity = (info or {}).get("activity") \
+            or working_cards.get(agent["pane_id"], {}).get("activity", "") \
+            or agent.get("title", "")
+        await update.message.reply_text(
+            working_text(agent, elapsed, activity, state=state,
+                         details=session_details_lines(info),
+                         branch=(info or {}).get("branch", "")),
+            parse_mode="HTML",
+            reply_markup=working_keyboard(agent["pane_id"]),
+        )
+
+
+async def cmd_quiet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /quiet [project] — toggle silent cards for a project."""
+    if not authorized(update):
+        return
+    args = ctx.args
+    if not args:
+        quiet = load_quiet()
+        names = [a.get("project") for a in agents if a.get("project")]
+        known = sorted({p for p in names if p})
+        lines = ["Quiet projects (cards arrive silently):",
+                 ", ".join(quiet) if quiet else "(none)",
+                 "", "Toggle with /quiet <project>.",
+                 "Known projects: " + (", ".join(known) if known else "(none connected)")]
+        await update.message.reply_text("\n".join(lines))
+        return
+    project = " ".join(args).strip()
+    quiet = load_quiet()
+    if project in quiet:
+        quiet.remove(project)
+        state = "removed — cards ping again"
+    else:
+        quiet.append(project)
+        state = "added — cards arrive silently"
+    save_quiet(quiet)
+    await update.message.reply_text(f"{project}: {state}")
+
+
+async def cmd_rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /rules — list and delete approval rules."""
+    if not authorized(update):
+        return
+    await update.message.reply_text(rules_text(), parse_mode="HTML",
+                                    reply_markup=rules_keyboard())
+
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /status — show connection info."""
     b = len([a for a in agents if a.get("status") == "blocked"])
@@ -689,22 +918,54 @@ async def cmd_trust(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Failed: {scrub(e)}")
 
 
-async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle /digest — show today's agent activity summary."""
+def digest_text() -> str:
     if not daily_stats:
-        await update.message.reply_text("No activity recorded yet today.")
-        return
-
-    import time
+        return "No activity recorded yet today."
     lines = ["Today's activity:\n"]
     sorted_agents = sorted(daily_stats.values(), key=lambda x: x.get("working_mins", 0), reverse=True)
     for s in sorted_agents:
         blocked = f", blocked {s['blocked_count']}x" if s.get("blocked_count") else ""
+        auto = f", auto-approved {s['auto_approved']}x" if s.get("auto_approved") else ""
         mins = s.get("working_mins", 0)
         time_str = f"{mins}m" if mins < 60 else f"{mins//60}h{mins%60}m"
-        lines.append(f"  {s['project']} ({s['agent']}): {time_str} working{blocked}")
+        lines.append(f"  {s['project']} ({s['agent']}): {time_str} working{blocked}{auto}")
+    return "\n".join(lines)
 
-    await update.message.reply_text("\n".join(lines))
+
+def seconds_until(hhmm: str, now_ts: float) -> float:
+    """Seconds from now_ts until the next local hh:mm occurrence."""
+    import time
+    hour, minute = (int(part) for part in hhmm.split(":", 1))
+    local = time.localtime(now_ts)
+    target = time.mktime((local.tm_year, local.tm_mon, local.tm_mday,
+                          hour, minute, 0, local.tm_wday, local.tm_yday, -1))
+    if target <= now_ts:
+        target += 86400
+    return target - now_ts
+
+
+async def morning_digest_task(app: Application):
+    """Push the daily digest once per day at HERDR_TG_DIGEST_AT (default 09:00)."""
+    at = os.environ.get("HERDR_TG_DIGEST_AT", "09:00")
+    if not CHAT_ID or not at:
+        return
+    while True:
+        try:
+            await asyncio.sleep(max(30, seconds_until(at, __import__("time").time())))
+            if not daily_stats:
+                continue
+            await app.bot.send_message(chat_id=int(CHAT_ID), text=digest_text())
+            daily_stats.clear()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("Morning digest failed: %s", scrub(e))
+            await asyncio.sleep(3600)
+
+
+async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /digest — show today's agent activity summary."""
+    await update.message.reply_text(digest_text())
 
 
 # --- Callback handler (buttons) ---
@@ -734,8 +995,43 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if action == "rule_del":
+        rules = approval_rules.load()
+        try:
+            index = int(data.get("i", -1))
+            removed = rules.pop(index)
+        except (ValueError, IndexError, TypeError):
+            removed = None
+        if removed is None:
+            await query.edit_message_text("That rule no longer exists.")
+            return
+        approval_rules.save(rules)
+        try:
+            await query.edit_message_text(
+                rules_text(), parse_mode="HTML", reply_markup=rules_keyboard())
+        except Exception:
+            pass
+        return
+
+    if action == "save_rule":
+        offer = rule_offers.pop(data.get("pane_id") or "", None)
+        if not offer:
+            await query.message.reply_text("That offer has expired.")
+            return
+        if approval_rules.is_dangerous(offer["subject"]):
+            await query.message.reply_text("Too dangerous for a rule — it will always ask.")
+            return
+        approval_rules.add_command_rule(offer["project"], offer["subject"])
+        try:
+            await query.edit_message_text(
+                offer.get("text", "♾") + "\n\n♾ Rule saved", parse_mode="HTML")
+        except Exception:
+            pass
+        return
+
     selected_agent = None
-    if action in {"read", "interrupt", "select_send", "select_reply", "trust", "approval"}:
+    if action in {"read", "interrupt", "select_send", "select_reply", "reply",
+                  "trust", "approval", "retry"}:
         eligible_action = "trust" if action == "approval" else action
         selected_agent = next(
             (agent for agent in agents_for_action(eligible_action) if agent.get("pane_id") == data.get("pane_id")),
@@ -747,6 +1043,79 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=refresh_keyboard(eligible_action),
             )
             return
+
+    if action in {"approve", "always", "trust_project", "reject"}:
+        pane_id = data.get("pane_id")
+        if not pane_id:
+            await query.message.reply_text("That approval action is no longer valid.")
+            return
+        live = approval_messages.get(pane_id)
+        stale = not data.get("g") or data["g"] != approval_tokens.get(pane_id)
+        if stale or not blocked_prompt_ids.get(pane_id):
+            # Answered elsewhere, or a newer prompt owns this pane: close the old
+            # card in place instead of sending yet another notification.
+            if live and query.message and query.message.message_id == live.get("message_id"):
+                await edit_approval_message(ctx.bot, pane_id, "⌛ Closed")
+            else:
+                await query.message.reply_text(
+                    "That approval belongs to an older prompt. Use the latest blocked notification."
+                )
+            return
+        # Destructive subjects confirm once: the first press re-renders the same
+        # card as a warning, the second executes. Reject always goes straight.
+        subject = approval_subject(live["summary"], live["detail"]) if live else ""
+        if (action in {"approve", "always", "trust_project"}
+                and approval_rules.is_dangerous(subject)
+                and not live.get("confirming")):
+            live["confirming"] = True
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=live["chat_id"], message_id=live["message_id"],
+                    text=approval_text(live["project"], live["host"], live["cwd"],
+                                       live.get("branch", ""), live["summary"],
+                                       live["detail"],
+                                       "⚠️ Destructive — press again to confirm"),
+                    parse_mode="HTML",
+                    reply_markup=approval_keyboard(pane_id, approval_tokens[pane_id]),
+                )
+            except Exception as e:
+                log.warning("Failed to arm approval confirm: %s", scrub(e))
+            return
+        if action == "always" and live:
+            approval_rules.add_command_rule(
+                live.get("project", ""), approval_subject(live.get("summary", ""), live.get("detail")))
+            outcome = "♾ Allowed · rule saved for this"
+        elif action == "trust_project" and live:
+            approval_rules.add_project_rule(live.get("project", ""))
+            outcome = "📁 Trusted project · allowed"
+        elif action == "reject":
+            outcome = "❌ Rejected"
+        else:
+            outcome = "✅ Allowed · once"
+        try:
+            await send_to_relay(pane_id, "Reject" if action == "reject" else "Allow once",
+                                prompt_id=blocked_prompt_ids.get(pane_id))
+        except Exception as e:
+            await query.message.reply_text(f"Failed: {scrub(e)}")
+            return
+        approval_tokens.pop(pane_id, None)
+        save_button = None
+        if action == "approve":
+            live = approval_messages.get(pane_id)
+            if live:
+                subject = approval_subject(live["summary"], live["detail"])
+                manual_approvals[(live["project"], subject)] += 1
+                if (manual_approvals[(live["project"], subject)] >= RULE_OFFER_AFTER
+                        and not approval_rules.is_dangerous(subject)):
+                    rule_offers[pane_id] = {"project": live["project"], "subject": subject}
+                    save_button = InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            "💾 Allow always for this",
+                            callback_data=pane_callback_data("save_rule", pane_id),
+                        )
+                    ]])
+        await edit_approval_message(ctx.bot, pane_id, outcome, reply_markup=save_button)
+        return
 
     if action == "read":
         content = await read_pane(data["pane_id"])
@@ -771,6 +1140,29 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if action == "select_reply":
         content = await read_pane(data["pane_id"])
         await send_reply_prompt(query.message, update.effective_chat, selected_agent, content)
+        return
+
+    if action == "reply":
+        await send_reply_prompt(query.message, update.effective_chat, selected_agent)
+        return
+
+    if action == "retry":
+        last = await fetch_last_prompt(data["pane_id"])
+        prompt = (last or {}).get("prompt")
+        if not prompt:
+            await query.message.reply_text("No previous prompt found to retry.")
+            return
+        try:
+            await send_text_to_relay(data["pane_id"], prompt)
+        except Exception as e:
+            await query.message.reply_text(f"Retry failed: {scrub(e)}")
+            return
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.message.reply_text(
+            f"🔁 Resubmitted the last prompt to {selected_agent['project']}.")
         return
 
     if action == "trust":
@@ -942,9 +1334,9 @@ def make_keyboard(
             for i, (label, _resp) in enumerate(buttons)
         ]
         keyboard.append([InlineKeyboardButton(
-            "Open output & reply",
-            callback_data=pane_callback_data("select_reply", pane_id),
-        )])
+            "👁 Details", callback_data=pane_callback_data("read", pane_id)),
+            InlineKeyboardButton("💬 Reply", callback_data=pane_callback_data("reply", pane_id)),
+        ])
         return InlineKeyboardMarkup(keyboard)
 
     # Standard approval prompts require a real numeric key press.
@@ -954,19 +1346,284 @@ def make_keyboard(
         for i, (label, _resp) in enumerate(buttons)
     ]
     keyboard.append([InlineKeyboardButton(
-        "Open output & reply",
-        callback_data=pane_callback_data("select_reply", pane_id),
-    )])
+        "👁 Details", callback_data=pane_callback_data("read", pane_id)),
+        InlineKeyboardButton("💬 Reply", callback_data=pane_callback_data("reply", pane_id)),
+    ])
     return InlineKeyboardMarkup(keyboard)
 
 
 def interaction_keyboard(pane_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "Open output & reply",
-            callback_data=pane_callback_data("select_reply", pane_id),
-        )
+        InlineKeyboardButton("👁 Details", callback_data=pane_callback_data("read", pane_id)),
+        InlineKeyboardButton("💬 Reply", callback_data=pane_callback_data("reply", pane_id)),
     ]])
+
+
+def approval_subject(summary: str, detail: list[str] | None) -> str:
+    return "\n".join([summary, *(detail or [])]).strip()
+
+
+# Known OpenCode permission kinds: (summary pattern, human title). The target
+# captured from the summary line rides under a Target heading; anything the
+# dialog lists as `- ...` lines becomes Patterns.
+PERMISSION_KINDS = [
+    (re.compile(r"^access external directory\s+(.+)$", re.I), "External directory access"),
+    (re.compile(r"^bash command\b\s*(.*)$", re.I), "Bash command"),
+    (re.compile(r"^(edit|write) file\s+(.+)$", re.I), "File edit"),
+    (re.compile(r"^read file\s+(.+)$", re.I), "File read"),
+]
+
+
+def parse_permission(summary: str, detail: list[str] | None):
+    """(title, target, patterns) with the noise ('Patterns' labels, dashes) gone."""
+    title, target = summary, None
+    for kind_re, label in PERMISSION_KINDS:
+        match = kind_re.match(summary)
+        if match:
+            title = label
+            target = next((g for g in match.groups() if g), None)
+            break
+    patterns, rest = [], []
+    for line in detail or []:
+        if line.strip().lower() == "patterns":
+            continue
+        if line.startswith("- "):
+            patterns.append(line[2:])
+        else:
+            rest.append(line)
+    if target is None and rest:
+        target = rest.pop(0)
+    patterns.extend(rest)
+    if target:
+        # A command restated with a `$` prefix duplicates the target; one copy.
+        norm = lambda line: line.strip().lstrip("$").strip()
+        patterns = [p for p in patterns if norm(p) != norm(target)]
+    return title, target, patterns[:6]
+
+
+def shorten_home(path: str) -> str:
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home) else path
+
+
+def fmt_duration(seconds) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{seconds:02d}s" if seconds else f"{minutes}m"
+    return f"{minutes // 60}h{minutes % 60}m"
+
+
+def waited_since(created: float) -> str:
+    import time
+    return fmt_duration(time.time() - created)
+
+
+def context_line(cwd: str, branch: str) -> str:
+    """The card's context strip: `~/project · branch`."""
+    line = f"<code>{html.escape(shorten_home(cwd))}</code>" if cwd else ""
+    if branch:
+        line = f"{line} · <i>{html.escape(branch)}</i>" if line else f"<i>{html.escape(branch)}</i>"
+    return line
+
+
+def approval_text(project: str, host: str, cwd: str, branch: str, summary: str,
+                  detail: list[str] | None, status: str) -> str:
+    """Hierarchical permission card: context header, named permission,
+    target/patterns, status. Everything else lives behind Details."""
+    mark = approval_rules.severity(approval_subject(summary, detail))
+    title, target, patterns = parse_permission(summary, detail)
+    header = f"🔐 <b>Approval</b> · <b>{html.escape(project)}</b>"
+    if host and host != "local":
+        header += f" · {html.escape(host)}"
+    lines = [header]
+    context = context_line(cwd, branch)
+    if context:
+        lines.append(context)
+    lines += ["", f"{mark} {html.escape(title)}"]
+    if target:
+        lines += ["", "Target", f"<code>{html.escape(shorten_home(target))}</code>"]
+    if patterns:
+        lines += ["", "Patterns"]
+        lines += [f"• <code>{html.escape(shorten_home(p))}</code>" for p in patterns]
+    lines += ["", status]
+    return "\n".join(lines)
+
+
+def approval_keyboard(pane_id: str, generation: str) -> InlineKeyboardMarkup:
+    # Allow once is full-width: the default action must not be mistakable for
+    # anything with lasting consequences.
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Allow once", callback_data=pane_callback_data(
+            "approve", pane_id, g=generation))],
+        [InlineKeyboardButton("♾ Allow always", callback_data=pane_callback_data(
+            "always", pane_id, g=generation)),
+         InlineKeyboardButton("📁 Trust project", callback_data=pane_callback_data(
+             "trust_project", pane_id, g=generation))],
+        [InlineKeyboardButton("❌ Reject", callback_data=pane_callback_data(
+            "reject", pane_id, g=generation)),
+         InlineKeyboardButton("👁 Details", callback_data=pane_callback_data("read", pane_id)),
+         InlineKeyboardButton("💬 Reply", callback_data=pane_callback_data("reply", pane_id))],
+    ])
+
+
+def rules_text() -> str:
+    rules = approval_rules.load()
+    if not rules:
+        return ("No approval rules yet.\n\n"
+                "Press ♾ Allow always on an approval card, or allow the same thing "
+                f"{RULE_OFFER_AFTER}× and a 💾 save-rule button appears.")
+    lines = [f"Approval rules ({len(rules)})", ""]
+    for i, rule in enumerate(rules, 1):
+        subject = rule.get("subject")
+        if subject is None:
+            scope = "project · all safe actions"
+        else:
+            scope = "always · " + " ".join(subject.split())[:70]
+        lines.append(f"{i}. {html.escape(rule.get('project', '?'))} · {html.escape(scope)}")
+    return "\n".join(lines)
+
+
+def rules_keyboard() -> InlineKeyboardMarkup:
+    rules = approval_rules.load()
+    row, rows = [], []
+    for i in range(len(rules)):
+        row.append(InlineKeyboardButton(
+            f"🗑 {i + 1}",
+            callback_data=json.dumps({"action": "rule_del", "i": i}, separators=(",", ":")),
+        ))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+async def edit_approval_message(app, pane_id: str, prefix: str,
+                                reply_markup=None) -> bool:
+    """Move a live approval card to its final state (edit, never re-notify)."""
+    info = approval_messages.pop(pane_id, None)
+    if not info:
+        return False
+    status = f"{prefix} · waited {waited_since(info['created'])}"
+    text = approval_text(info["project"], info["host"], info["cwd"],
+                         info.get("branch", ""), info["summary"],
+                         info["detail"], status)
+    if reply_markup is not None and pane_id in rule_offers:
+        rule_offers[pane_id]["text"] = text
+    try:
+        await app.bot.edit_message_text(
+            chat_id=info["chat_id"],
+            message_id=info["message_id"],
+            text=text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+        return True
+    except Exception as e:
+        log.warning("Failed to close approval message: %s", scrub(e))
+        return False
+
+
+# ponytail: keyword heuristic over the pane tail, not a real exit-status channel —
+# opencode does not expose one; upgrade when the agent reports failures structurally.
+COMPLETION_FAILURE_RE = re.compile(
+    r"\berrors?\b|\bfail(?:ed|ure|ing)?\b|\btraceback\b|\bexception\b|✗|✖|exit code [1-9]",
+    re.IGNORECASE,
+)
+NO_FAILURE_RE = re.compile(r"\b0\s+(?:errors?|failed|failures)\b|\bno\s+(?:errors?|failures)\b", re.IGNORECASE)
+
+
+def completion_summary(content: str):
+    """(failed, last meaningful lines, hidden count) from a finished pane."""
+    lines = [line.strip() for line in (content or "").splitlines() if line.strip()]
+    if not lines:
+        return False, [], 0
+    window = NO_FAILURE_RE.sub("", "\n".join(lines[-10:]))
+    failed = bool(COMPLETION_FAILURE_RE.search(window))
+    take = 8 if failed else 4
+    hidden = max(0, len(lines) - take)
+    return failed, lines[-take:], hidden
+
+
+def finished_keyboard(pane_id: str, failed: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if failed:
+        rows.append([InlineKeyboardButton("🔁 Retry", callback_data=pane_callback_data(
+            "retry", pane_id))])
+    last = [InlineKeyboardButton("👁 Details", callback_data=pane_callback_data("read", pane_id)),
+            InlineKeyboardButton("💬 Reply", callback_data=pane_callback_data("reply", pane_id))]
+    base = _web_base()
+    if base:
+        last.append(InlineKeyboardButton("🌐 Web", url=f"{base}/?pane={pane_id}"))
+    rows.append(last)
+    return InlineKeyboardMarkup(rows)
+
+
+def working_keyboard(pane_id: str) -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton("⛔ Interrupt", callback_data=pane_callback_data("interrupt", pane_id)),
+        InlineKeyboardButton("👁 Details", callback_data=pane_callback_data("read", pane_id)),
+    ]]
+    base = _web_base()
+    if base:
+        rows[0].append(InlineKeyboardButton("🌐 Web", url=f"{base}/?pane={pane_id}"))
+    return InlineKeyboardMarkup(rows)
+
+
+def working_text(agent_data: dict, elapsed, title: str, state: str = "working",
+                 details: list[str] | None = None, branch: str = "") -> str:
+    """Live session card. `state`: working | paused | ended. `title` is the live
+    activity line; `details` are the opencode session lines (context, cost, todos)."""
+    project = agent_data.get("project") or agent_data.get("agent") or "agent"
+    host = agent_data.get("host", "local")
+    cwd = agent_data.get("cwd", "")
+    mark, verb = {
+        "working": ("⚙️", "working"),
+        "paused": ("⏸", "waiting for approval"),
+        "ended": ("⏹", "session ended"),
+        "stuck": ("🐌", "possibly stuck"),
+    }[state]
+    header = f"{mark} <b>{project}</b> · {verb}"
+    if state != "ended":
+        header += f" · {fmt_duration(elapsed)}"
+    if host and host != "local":
+        header += f" · {html.escape(host)}"
+    out = [header]
+    context = context_line(cwd, branch)
+    if context:
+        out.append(context)
+    body = details if details else ([html.escape(title)] if title else [])
+    if body:
+        out += ["", *body]
+    return "\n".join(out)
+
+
+def finished_text(agent_data: dict, duration, lines: list[str], hidden: int,
+                  failed: bool, branch: str = "") -> str:
+    """Completion card: verdict + duration, project context, last output."""
+    project = agent_data.get("project") or agent_data.get("agent") or "agent"
+    host = agent_data.get("host", "local")
+    cwd = agent_data.get("cwd", "")
+    mark, verb = ("❌", "failed") if failed else ("✅", "finished")
+    header = f"{mark} <b>{html.escape(project)}</b> {verb} · {fmt_duration(duration)}"
+    if host and host != "local":
+        header += f" · {html.escape(host)}"
+    out = [header]
+    context = context_line(cwd, branch)
+    if context:
+        out.append(context)
+    out.append("")
+    if lines:
+        out += [html.escape(line) for line in lines]
+        if hidden:
+            out.append(f"<i>… {hidden} more lines</i>")
+    else:
+        out.append("<i>Completed with no output.</i>")
+    return "\n".join(out)
 
 
 async def notify_blocked(
@@ -979,18 +1636,42 @@ async def notify_blocked(
     prompt_id: str | None = None,
     interaction: str | None = None,
     multi: bool = False,
+    host: str = "",
+    summary: str | None = None,
+    detail: list[str] | None = None,
+    cwd: str = "",
+    branch: str = "",
 ):
     if not CHAT_ID:
         return
-    instruction = (
-        "Use the web terminal or manual terminal controls to select multiple options."
-        if multi
-        else "Use an approval button, open the output, or reply to this notification."
-    )
-    text = (
-        f"*{agent}* blocked in `{project}`\n\n```\n{prompt[:400]}\n```\n\n"
-        f"{instruction}"
-    )
+    if interaction == "opencode_permission" and summary:
+        import time
+        msg = await app.bot.send_message(
+            chat_id=int(CHAT_ID),
+            text=approval_text(project, host, cwd, branch, summary, detail, "⏳ Waiting"),
+            parse_mode="HTML",
+            reply_markup=approval_keyboard(pane_id, generation := secrets.token_hex(4)),
+        )
+        approval_tokens[pane_id] = generation
+        if prompt_id:
+            blocked_prompt_ids[pane_id] = prompt_id
+        approval_messages[pane_id] = {
+            "chat_id": int(CHAT_ID),
+            "message_id": msg.message_id,
+            "project": project,
+            "host": host,
+            "cwd": cwd,
+            "branch": branch,
+            "summary": summary,
+            "detail": detail or [],
+            "created": time.time(),
+        }
+        register_pending(int(CHAT_ID), msg.message_id, pane_id)
+        return
+    # Only the unusual case explains itself: multi-select needs the web terminal.
+    body = f"*{agent}* blocked in `{project}`\n\n```\n{prompt[:400]}\n```"
+    if multi:
+        body += "\n\nUse the web terminal or manual terminal controls to select multiple options."
     generation = secrets.token_hex(4)
     keyboard = make_keyboard(
         pane_id,
@@ -999,7 +1680,7 @@ async def notify_blocked(
         interaction=interaction,
     )
     msg = await app.bot.send_message(
-        chat_id=int(CHAT_ID), text=text, parse_mode="Markdown", reply_markup=keyboard
+        chat_id=int(CHAT_ID), text=body, parse_mode="Markdown", reply_markup=keyboard
     )
     approval_tokens[pane_id] = generation
     if prompt_id:
@@ -1010,6 +1691,26 @@ async def notify_blocked(
 async def notify_blocked_safely(app: Application, msg: dict):
     if msg.get("update"):
         return
+    # Rules first: a matched safe request never interrupts Telegram at all.
+    if (
+        msg.get("interaction") == "opencode_permission"
+        and msg.get("summary")
+        and msg.get("prompt_id")
+    ):
+        subject = approval_subject(msg["summary"], msg.get("detail") or [])
+        if approval_rules.allows(msg.get("project", ""), subject):
+            try:
+                await send_to_relay(msg["pane_id"], "Allow once", prompt_id=msg["prompt_id"])
+                import time
+                stats = daily_stats.setdefault(msg["pane_id"], {
+                    "agent": msg.get("agent", ""), "project": msg.get("project", ""),
+                    "blocked_count": 0, "working_mins": 0, "last_change": time.time(),
+                })
+                stats["auto_approved"] = stats.get("auto_approved", 0) + 1
+                log.info("Auto-approved %s: rule matched", scrub(msg.get("project", "")))
+                return
+            except Exception as e:
+                log.warning("Auto-approve failed, notifying instead: %s", scrub(e))
     try:
         await notify_blocked(
             app,
@@ -1021,6 +1722,11 @@ async def notify_blocked_safely(app: Application, msg: dict):
             prompt_id=msg.get("prompt_id"),
             interaction=msg.get("interaction"),
             multi=bool(msg.get("multi")),
+            host=msg.get("host", ""),
+            summary=msg.get("summary"),
+            detail=msg.get("detail"),
+            cwd=msg.get("cwd", ""),
+            branch=msg.get("branch", ""),
         )
     except Exception as e:
         log.warning("Failed to send blocked notification: %s", scrub(e))
@@ -1049,6 +1755,7 @@ async def track_agent_updates(app: Application, updated_agents: list[dict]):
                 "last_change": now,
             }
         stats = daily_stats[pane_id]
+        run_started = stats["last_change"]
         if old_status == "working" and old_status != new_status:
             stats["working_mins"] += int((now - stats["last_change"]) / 60)
         if new_status == "blocked" and old_status != "blocked":
@@ -1058,18 +1765,171 @@ async def track_agent_updates(app: Application, updated_agents: list[dict]):
         if agent_data.get("status") and new_status != "blocked":
             approval_tokens.pop(pane_id, None)
             blocked_prompt_ids.pop(pane_id, None)
+            if pane_id in approval_messages:
+                # Answered in the terminal or pane gone: settle the card, no ping.
+                await edit_approval_message(app, pane_id, "⌛ Closed")
+
+        # One nudge if an approval card has been sitting for NUDGE_AFTER.
+        if new_status == "blocked":
+            approval = approval_messages.get(pane_id)
+            if (approval and not approval.get("nudged")
+                    and now - approval.get("created", now) > NUDGE_AFTER):
+                approval["nudged"] = True
+                try:
+                    await app.bot.send_message(
+                        chat_id=int(CHAT_ID),
+                        text=(f"⏰ <b>{html.escape(agent_data.get('project') or 'agent')}</b> "
+                              f"has been waiting for approval for "
+                              f"{fmt_duration(now - approval['created'])} — the 🔐 card is above."),
+                        parse_mode="HTML",
+                        disable_notification=is_quiet(agent_data.get("project", "")),
+                    )
+                except Exception as e:
+                    log.warning("Failed to send approval nudge: %s", scrub(e))
+
+        # Rolling session card: one message per pane that flips between ⚙️ and
+        # ✅/❌. A finish that restarts within FLAP_GRACE reuses the same card
+        # (opencode flaps working/idle between turns; a flap is not a session).
+        card = working_cards.get(pane_id)
+        if new_status == "working":
+            title = agent_data.get("title", "")
+            restart = card is not None and card.get("state") != "working"
+            if card is None or (restart and now - card.get("finished_at", 0) > FLAP_GRACE):
+                try:
+                    info = await fetch_session_info(pane_id)
+                    activity = (info or {}).get("activity") or title
+                    msg = await app.bot.send_message(
+                        chat_id=int(CHAT_ID),
+                        text=working_text(agent_data, now - run_started, activity,
+                                          details=session_details_lines(info),
+                                          branch=(info or {}).get("branch", "")),
+                        parse_mode="HTML",
+                        reply_markup=working_keyboard(pane_id),
+                        disable_notification=is_quiet(agent_data.get("project", "")),
+                    )
+                    working_cards[pane_id] = {
+                        "chat_id": int(CHAT_ID), "message_id": msg.message_id,
+                        "started": run_started, "title": title,
+                        "activity": activity, "last_edit": now,
+                        "paused": False, "agent": agent_data, "state": "working",
+                    }
+                    register_pending(int(CHAT_ID), msg.message_id, pane_id)
+                    log.info("Working card sent: %s (%s)",
+                             scrub(agent_data.get("project", "")), scrub(pane_id))
+                except Exception as e:
+                    log.warning("Failed to send working card: %s", scrub(e))
+            elif restart:
+                # Flap: the result card flips straight back to working.
+                card.update(state="working", started=run_started, last_edit=now,
+                            paused=False, title=title, agent=agent_data,
+                            finished_at=None)
+                card.pop("stuck_mark", None)
+                try:
+                    info = await fetch_session_info(pane_id)
+                    card["activity"] = (info or {}).get("activity") or title
+                    await app.bot.edit_message_text(
+                        chat_id=card["chat_id"], message_id=card["message_id"],
+                        text=working_text(agent_data, 0, card["activity"],
+                                          details=session_details_lines(info),
+                                          branch=(info or {}).get("branch", "")),
+                        parse_mode="HTML",
+                        reply_markup=working_keyboard(pane_id),
+                    )
+                except Exception as e:
+                    log.warning("Failed to resume working card: %s", scrub(e))
+            elif (
+                title != card["title"] or card.get("paused")
+                or now - card["last_edit"] >= 60
+            ):
+                card.update(title=title, last_edit=now, paused=False, agent=agent_data)
+                try:
+                    info = await fetch_session_info(pane_id)
+                    activity = (info or {}).get("activity") or title
+                    card["activity"] = activity
+                    # Stuck: opencode's session row has not moved in STUCK_AFTER.
+                    updated_ms = (info or {}).get("updated_ms") or 0
+                    stale = bool(updated_ms) and now * 1000 - updated_ms > STUCK_AFTER * 1000
+                    await app.bot.edit_message_text(
+                        chat_id=card["chat_id"], message_id=card["message_id"],
+                        text=working_text(agent_data, now - card["started"], activity,
+                                          details=session_details_lines(info),
+                                          branch=(info or {}).get("branch", ""),
+                                          state="stuck" if stale else "working"),
+                        parse_mode="HTML",
+                        reply_markup=working_keyboard(pane_id),
+                    )
+                    if stale and card.get("stuck_mark") != updated_ms:
+                        card["stuck_mark"] = updated_ms
+                        await app.bot.send_message(
+                            chat_id=int(CHAT_ID),
+                            text=(f"🐌 <b>{html.escape(agent_data.get('project') or 'agent')}</b> "
+                                  "has not touched its session in "
+                                  f"{fmt_duration((now * 1000 - updated_ms) / 1000)} — possibly stuck. "
+                                  "⛔ Interrupt it or 💬 Reply from its card."),
+                            parse_mode="HTML",
+                            disable_notification=is_quiet(agent_data.get("project", "")),
+                        )
+                    if not stale:
+                        card.pop("stuck_mark", None)
+                except Exception as e:
+                    log.warning("Failed to update working card: %s", scrub(e))
+        elif new_status == "blocked" and card is not None and not card.get("paused"):
+            card.update(paused=True, last_edit=now, agent=agent_data)
+            try:
+                await app.bot.edit_message_text(
+                    chat_id=card["chat_id"], message_id=card["message_id"],
+                    text=working_text(agent_data, now - card["started"],
+                                      card.get("activity", ""), state="paused"),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                log.warning("Failed to pause working card: %s", scrub(e))
 
         if old_status and old_status != new_status and new_status in ("idle", "done") and old_status in ("working", "blocked"):
             try:
-                msg = await app.bot.send_message(
-                    chat_id=int(CHAT_ID),
-                    text=(
-                        f"{agent_data['project']} ({agent_data['agent']}) finished.\n\n"
-                        "Open the output below, or reply to this notification to send a follow-up."
-                    ),
-                    reply_markup=interaction_keyboard(pane_id),
-                )
-                register_pending(int(CHAT_ID), msg.message_id, pane_id)
+                content = await read_pane(pane_id)
+                failed, lines, hidden = completion_summary(content)
+                info = await fetch_session_info(pane_id)
+                text = finished_text(agent_data, now - run_started, lines, hidden, failed,
+                                     branch=(info or {}).get("branch", ""))
+                auto = int(stats.get("auto_approved", 0))
+                if auto:
+                    text += f"\n\n🔇 {auto} auto-approved by rules"
+                keyboard = finished_keyboard(pane_id, failed)
+                card = working_cards.get(pane_id)
+                edited = False
+                if card:
+                    # The session's one message becomes its own result.
+                    try:
+                        await app.bot.edit_message_text(
+                            chat_id=card["chat_id"], message_id=card["message_id"],
+                            text=text, parse_mode="HTML",
+                            reply_markup=keyboard,
+                        )
+                        register_pending(card["chat_id"], card["message_id"], pane_id)
+                        edited = True
+                    except Exception:
+                        pass  # too old to edit: fall through to a fresh message
+                if not edited:
+                    msg = await app.bot.send_message(
+                        chat_id=int(CHAT_ID),
+                        text=text,
+                        parse_mode="HTML",
+                        reply_markup=keyboard,
+                        disable_notification=is_quiet(agent_data.get("project", "")),
+                    )
+                    register_pending(int(CHAT_ID), msg.message_id, pane_id)
+                if card is not None:
+                    card.update(state="finished", finished_at=now, last_edit=now,
+                                agent=agent_data, activity="")
+                    card.pop("stuck_mark", None)
+                else:
+                    working_cards[pane_id] = {
+                        "chat_id": int(CHAT_ID), "message_id": msg.message_id,
+                        "state": "finished", "finished_at": now, "last_edit": now,
+                        "started": run_started, "paused": False,
+                        "agent": agent_data, "title": "", "activity": "",
+                    }
             except Exception as e:
                 log.warning("Failed to send completion notification: %s", scrub(e))
         prev_statuses[pane_id] = new_status
@@ -1101,6 +1961,25 @@ async def relay_listener(app: Application):
                             if pane_id not in blocked_panes:
                                 approval_tokens.pop(pane_id, None)
                                 blocked_prompt_ids.pop(pane_id, None)
+                                if pane_id in approval_messages:
+                                    await edit_approval_message(
+                                        app, pane_id, "⌛ Closed")
+                        # A pane that vanished mid-run never sends a finished
+                        # status; settle its session card instead.
+                        live_panes = {agent.get("pane_id") for agent in new_agents}
+                        for pane_id in list(working_cards):
+                            if pane_id not in live_panes:
+                                card = working_cards.pop(pane_id)
+                                try:
+                                    await app.bot.edit_message_text(
+                                        chat_id=card["chat_id"],
+                                        message_id=card["message_id"],
+                                        text=working_text(card["agent"], 0,
+                                                          card["title"], state="ended"),
+                                        parse_mode="HTML",
+                                    )
+                                except Exception as e:
+                                    log.warning("Failed to settle gone pane card: %s", scrub(e))
                         await track_agent_updates(app, new_agents)
                         agents = apply_agent_message(agents, msg)
 
@@ -1130,6 +2009,9 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start, filters=auth_filter))
     app.add_handler(CommandHandler("agents", cmd_agents, filters=auth_filter))
+    app.add_handler(CommandHandler("now", cmd_now, filters=auth_filter))
+    app.add_handler(CommandHandler("rules", cmd_rules, filters=auth_filter))
+    app.add_handler(CommandHandler("quiet", cmd_quiet, filters=auth_filter))
     app.add_handler(CommandHandler("status", cmd_status, filters=auth_filter))
     app.add_handler(CommandHandler("session", cmd_session, filters=auth_filter))
     app.add_handler(CommandHandler("read", cmd_read, filters=auth_filter))
@@ -1148,6 +2030,7 @@ def main():
         async with app:
             await app.start()
             await app.updater.start_polling()
+            asyncio.create_task(morning_digest_task(app))
             await relay_listener(app)
 
     loop.run_until_complete(run())

@@ -66,15 +66,24 @@ class FakeCallback:
         self.edit_calls += 1
         self.edited_markup = reply_markup
 
+    async def edit_message_text(self, text=None, **kwargs):
+        self.edited_text = text
+        self.edited_text_kwargs = kwargs
+
 
 class FakeBot:
     def __init__(self):
         self.sent = []
+        self.edits = []
 
     async def send_message(self, chat_id, text, **kwargs):
         message = SimpleNamespace(message_id=500 + len(self.sent), chat_id=chat_id)
         self.sent.append((chat_id, text, kwargs, message))
         return message
+
+    async def edit_message_text(self, chat_id, message_id, text, **kwargs):
+        self.edits.append((chat_id, message_id, text, kwargs))
+        return True
 
 
 class FakeRelayConnection:
@@ -130,6 +139,15 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         tg.approval_tokens.clear()
         tg.blocked_prompt_ids.clear()
         tg.prev_statuses.clear()
+        tg.approval_messages.clear()
+        tg.working_cards.clear()
+        tg.daily_stats.clear()
+        fetch_patch = patch.object(tg, "fetch_session_info", AsyncMock(return_value=None))
+        fetch_patch.start()
+        self.addCleanup(fetch_patch.stop)
+        web_patch = patch.object(tg, "_web_base", return_value="")
+        web_patch.start()
+        self.addCleanup(web_patch.stop)
         tg.daily_stats.clear()
 
     def tearDown(self):
@@ -323,14 +341,363 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         bot = FakeBot()
         app = SimpleNamespace(bot=bot)
         tg.prev_statuses["w0:p1"] = "working"
-        await tg.track_agent_updates(app, tg.agents)
+        with patch.object(
+            tg, "read_pane",
+            AsyncMock(return_value="Build completed successfully.\n3 files changed, tests passed."),
+        ):
+            await tg.track_agent_updates(app, tg.agents)
         chat_id, text, kwargs, sent = bot.sent[0]
         self.assertEqual(chat_id, 42)
-        self.assertIn("completed (opencode) finished", text)
+        self.assertIn("✅ <b>completed</b> finished", text)
+        self.assertIn("3 files changed, tests passed.", text)
+        self.assertIn("<code>/work/completed/0</code>", text)
         button = kwargs["reply_markup"].inline_keyboard[0][0]
-        self.assertEqual(button.text, "Open output & reply")
+        self.assertEqual(button.text, "👁 Details")
         self.assertEqual(tg.parse_callback_data(button.callback_data)["pane_id"], "w0:p1")
         self.assertEqual(tg.pending_pane(42, sent.message_id), "w0:p1")
+
+    async def test_failed_completion_shows_error_tail(self):
+        bot = FakeBot()
+        app = SimpleNamespace(bot=bot)
+        tg.prev_statuses["w0:p1"] = "working"
+        agents = make_agents(1, status="idle", project="broken")
+        with patch.object(
+            tg, "read_pane",
+            AsyncMock(return_value="running tests...\nnpm test failed\n2 tests failed in auth.spec.ts"),
+        ):
+            await tg.track_agent_updates(app, agents)
+        text = bot.sent[0][1]
+        self.assertIn("❌ <b>broken</b> failed", text)
+        self.assertIn("2 tests failed in auth.spec.ts", text)
+
+    async def test_zero_failures_still_counts_as_success(self):
+        failed, _lines, _hidden = tg.completion_summary("✓ 42 passed, 0 failed")
+        self.assertFalse(failed)
+
+    async def test_long_output_is_truncated_with_count(self):
+        content = "\n".join(f"line {i}" for i in range(30))
+        failed, lines, hidden = tg.completion_summary(content)
+        self.assertFalse(failed)
+        self.assertEqual(len(lines), 4)
+        self.assertEqual(hidden, 26)
+        text = tg.finished_text({"project": "p", "host": "local", "cwd": "/w/p"},
+                                14, lines, hidden, failed)
+        self.assertIn("… 26 more lines", text)
+        self.assertIn("finished · 14s", text)
+
+    async def test_empty_output_says_so(self):
+        text = tg.finished_text({"project": "quiet", "host": "local", "cwd": ""},
+                                3, [], 0, False)
+        self.assertIn("Completed with no output.", text)
+
+    async def test_working_session_gets_live_card(self):
+        bot = FakeBot()
+        app = SimpleNamespace(bot=bot)
+        tg.prev_statuses["w0:p1"] = "idle"
+        await tg.track_agent_updates(app, make_agents(1, status="working", project="live"))
+        chat_id, text, kwargs, sent = bot.sent[0]
+        self.assertIn("⚙️ <b>live</b> · working", text)
+        self.assertIn("<code>/work/live/0</code>", text)
+        buttons = [b.text for b in kwargs["reply_markup"].inline_keyboard[0]]
+        self.assertEqual(buttons, ["⛔ Interrupt", "👁 Details"])
+        self.assertEqual(tg.pending_pane(chat_id, sent.message_id), "w0:p1")
+        self.assertEqual(len(bot.edits), 0)
+
+    async def test_working_card_edit_fires_on_title_change_only(self):
+        bot = FakeBot()
+        app = SimpleNamespace(bot=bot)
+        tg.prev_statuses["w0:p1"] = "idle"
+        agents = make_agents(1, status="working", project="live")
+        await tg.track_agent_updates(app, agents)
+        # same title, within the minute: silent
+        await tg.track_agent_updates(app, agents)
+        self.assertEqual(len(bot.edits), 0)
+        # new activity title: edit in place
+        agents[0]["title"] = "Fixing auth token refresh"
+        await tg.track_agent_updates(app, agents)
+        self.assertEqual(len(bot.edits), 1)
+        self.assertIn("Fixing auth token refresh", bot.edits[0][2])
+
+    async def test_working_card_pauses_while_blocked(self):
+        bot = FakeBot()
+        app = SimpleNamespace(bot=bot)
+        tg.prev_statuses["w0:p1"] = "idle"
+        await tg.track_agent_updates(app, make_agents(1, status="working", project="live"))
+        tg.prev_statuses["w0:p1"] = "working"
+        await tg.track_agent_updates(app, make_agents(1, status="blocked", project="live"))
+        self.assertEqual(len(bot.edits), 1)
+        self.assertIn("⏸ <b>live</b> · waiting for approval", bot.edits[0][2])
+
+    async def test_finish_edits_the_working_card_not_a_new_message(self):
+        bot = FakeBot()
+        app = SimpleNamespace(bot=bot)
+        tg.prev_statuses["w0:p1"] = "idle"
+        await tg.track_agent_updates(app, make_agents(1, status="working", project="live"))
+        self.assertEqual(len(bot.sent), 1)
+        tg.prev_statuses["w0:p1"] = "working"
+        with patch.object(
+            tg, "read_pane",
+            AsyncMock(return_value="Build completed successfully.\n3 files changed."),
+        ):
+            await tg.track_agent_updates(app, make_agents(1, status="done", project="live"))
+        self.assertEqual(len(bot.sent), 1)          # no new message
+        self.assertEqual(len(bot.edits), 1)         # the card became the result
+        self.assertIn("✅ <b>live</b> finished", bot.edits[0][2])
+        # The rolling card stays as this pane's slot, now in finished state.
+        self.assertEqual(tg.working_cards["w0:p1"]["state"], "finished")
+
+    async def test_flap_reuses_card_within_grace(self):
+        bot = FakeBot()
+        app = SimpleNamespace(bot=bot)
+        tg.prev_statuses["w0:p1"] = "idle"
+        await tg.track_agent_updates(app, make_agents(1, status="working", project="live"))
+        self.assertEqual(len(bot.sent), 1)
+        tg.prev_statuses["w0:p1"] = "working"
+        with patch.object(tg, "read_pane", AsyncMock(return_value="ok")):
+            await tg.track_agent_updates(app, make_agents(1, status="done", project="live"))
+        self.assertEqual(len(bot.sent), 1)
+        # The agent restarts within the grace window: same card, flipped back.
+        tg.prev_statuses["w0:p1"] = "idle"
+        await tg.track_agent_updates(app, make_agents(1, status="working", project="live"))
+        self.assertEqual(len(bot.sent), 1)          # still one message
+        self.assertEqual(len(bot.edits), 2)         # finish + resume
+        self.assertIn("⚙️ <b>live</b> · working", bot.edits[1][2])
+
+    async def test_restart_beyond_grace_gets_a_new_card(self):
+        import time
+        bot = FakeBot()
+        app = SimpleNamespace(bot=bot)
+        tg.prev_statuses["w0:p1"] = "idle"
+        await tg.track_agent_updates(app, make_agents(1, status="working", project="live"))
+        with patch.object(tg, "read_pane", AsyncMock(return_value="ok")):
+            tg.prev_statuses["w0:p1"] = "working"
+            await tg.track_agent_updates(app, make_agents(1, status="done", project="live"))
+        tg.working_cards["w0:p1"]["finished_at"] = time.time() - 999
+        tg.prev_statuses["w0:p1"] = "idle"
+        await tg.track_agent_updates(app, make_agents(1, status="working", project="live"))
+        self.assertEqual(len(bot.sent), 2)          # genuinely new session: new card
+        self.assertEqual(tg.working_cards["w0:p1"]["state"], "working")
+
+    async def test_stale_approval_gets_one_nudge(self):
+        import time
+        bot = FakeBot()
+        app = SimpleNamespace(bot=bot)
+        tg.approval_messages["w0:p1"] = {
+            "chat_id": 42, "message_id": 9, "project": "slow", "host": "local",
+            "cwd": "", "branch": "", "summary": "s", "detail": [],
+            "created": time.time() - 400,
+        }
+        tg.prev_statuses["w0:p1"] = "working"
+        await tg.track_agent_updates(app, make_agents(1, status="blocked", project="slow"))
+        self.assertEqual(len(bot.sent), 1)
+        self.assertIn("waiting for approval", bot.sent[0][1])
+        # Later snapshots never repeat the nudge.
+        tg.prev_statuses["w0:p1"] = "blocked"
+        await tg.track_agent_updates(app, make_agents(1, status="blocked", project="slow"))
+        self.assertEqual(len(bot.sent), 1)
+
+    async def test_stuck_session_flips_card_and_pings_once(self):
+        import time
+        bot = FakeBot()
+        app = SimpleNamespace(bot=bot)
+        agents = make_agents(1, status="working", project="stuck-proj")
+        tg.prev_statuses["w0:p1"] = "idle"
+        await tg.track_agent_updates(app, agents)
+        card = tg.working_cards["w0:p1"]
+        stale = {"updated_ms": (time.time() - 700) * 1000, "activity": "Bash: x",
+                 "todos": [], "context_tokens": 0, "cost": 0, "model_id": "", "branch": ""}
+        card["last_edit"] = time.time() - 61          # force the minute tick
+        with patch.object(tg, "fetch_session_info", AsyncMock(return_value=stale)):
+            await tg.track_agent_updates(app, agents)
+        self.assertEqual(len(bot.edits), 1)
+        self.assertIn("possibly stuck", bot.edits[0][2])
+        self.assertEqual(len(bot.sent), 2)            # working card + the nudge
+        self.assertIn("possibly stuck", bot.sent[1][1])
+        card["last_edit"] = time.time() - 61
+        with patch.object(tg, "fetch_session_info", AsyncMock(return_value=stale)):
+            await tg.track_agent_updates(app, agents)
+        self.assertEqual(len(bot.sent), 2)            # same staleness: no repeat
+
+    def test_seconds_until_rolls_to_tomorrow(self):
+        import time
+        now = time.mktime(time.strptime("2026-09-13 10:00", "%Y-%m-%d %H:%M"))
+        self.assertAlmostEqual(tg.seconds_until("11:00", now), 3600, delta=5)
+        self.assertAlmostEqual(tg.seconds_until("09:00", now), 23 * 3600, delta=5)
+
+    def test_digest_text_includes_auto_approvals(self):
+        tg.daily_stats["p1"] = {"project": "nodehr", "agent": "opencode",
+                                "working_mins": 12, "blocked_count": 2, "auto_approved": 4}
+        text = tg.digest_text()
+        self.assertIn("nodehr (opencode): 12m working, blocked 2x, auto-approved 4x", text)
+
+    async def test_dangerous_approval_requires_second_press(self):
+        tg.relay_connected = True
+        tg.agents = make_agents(1, status="blocked", project="danger")
+        gen = "abcd1234"
+        tg.approval_tokens["w0:p1"] = gen
+        tg.blocked_prompt_ids["w0:p1"] = "pid1"
+        tg.approval_messages["w0:p1"] = {
+            "chat_id": 42, "message_id": 10, "project": "danger", "host": "local",
+            "cwd": "/w/danger", "branch": "main", "summary": "Bash command clean",
+            "detail": ["$ rm -rf build"], "created": 1.0,
+        }
+        ctx = SimpleNamespace(bot=FakeBot())
+        with patch.object(tg, "send_to_relay", AsyncMock()) as respond:
+            first = FakeCallback(tg.pane_callback_data("approve", "w0:p1", g=gen))
+            await tg.handle_callback(make_update(callback=first), ctx)
+            respond.assert_not_awaited()
+            self.assertIn("press again to confirm", ctx.bot.edits[0][2])
+
+            second = FakeCallback(tg.pane_callback_data("approve", "w0:p1", g=gen))
+            await tg.handle_callback(make_update(callback=second), ctx)
+            respond.assert_awaited_once_with("w0:p1", "Allow once", prompt_id="pid1")
+
+    async def test_quiet_project_cards_arrive_silently(self):
+        with patch.object(tg, "load_quiet", return_value=["watchtube"]):
+            bot = FakeBot()
+            app = SimpleNamespace(bot=bot)
+            tg.prev_statuses["w0:p1"] = "idle"
+            await tg.track_agent_updates(
+                app, make_agents(1, status="working", project="watchtube"))
+            self.assertTrue(bot.sent[0][2].get("disable_notification"))
+        tg.working_cards.clear()
+        bot = FakeBot()
+        app = SimpleNamespace(bot=bot)
+        tg.prev_statuses["w0:p1"] = "idle"
+        await tg.track_agent_updates(
+            app, make_agents(1, status="working", project="loud"))
+        self.assertFalse(bot.sent[0][2].get("disable_notification"))
+
+    async def test_quiet_command_toggles_membership(self):
+        with patch.object(tg, "load_quiet", return_value=["watchtube"]), \
+                patch.object(tg, "save_quiet") as save:
+            update = make_update()
+            await tg.cmd_quiet(update, SimpleNamespace(args=["nodehr"]))
+            save.assert_called_once_with(["watchtube", "nodehr"])
+            self.assertIn("added", update.message.replies[0][0])
+
+            update = make_update()
+            await tg.cmd_quiet(update, SimpleNamespace(args=["watchtube"]))
+            save.assert_called_with(["nodehr"])
+            self.assertIn("removed", update.message.replies[0][0])
+
+    def test_web_button_appears_only_with_hostname(self):
+        with patch.object(tg, "_web_base", return_value="https://relay.example.com"):
+            keyboard = tg.working_keyboard("w0:p1")
+            web = [b for row in keyboard.inline_keyboard for b in row if b.text == "🌐 Web"]
+            self.assertEqual(len(web), 1)
+            self.assertEqual(web[0].url, "https://relay.example.com/?pane=w0:p1")
+        with patch.object(tg, "_web_base", return_value=""):
+            keyboard = tg.finished_keyboard("w0:p1", failed=True)
+            texts = [b.text for row in keyboard.inline_keyboard for b in row]
+            self.assertEqual(texts, ["🔁 Retry", "👁 Details", "💬 Reply"])
+
+    async def test_now_lists_one_card_per_active_session(self):
+        tg.relay_connected = True
+        tg.agents = make_agents(3, status="idle")
+        tg.agents[0].update(status="working", project="alpha", pane_id="w0:p1")
+        tg.agents[2].update(status="blocked", project="beta", pane_id="w2:p1")
+        info = {
+            "context_tokens": 217447, "created_ms": 1789300000000, "cost": 0.0,
+            "model_id": "glm-5.3",
+            "todos": [
+                {"status": "in_progress", "content": "Backend: portal login"},
+                {"status": "pending", "content": "Frontend: feature module"},
+                {"status": "completed", "content": "Setup"},
+            ],
+        }
+        with patch.object(tg, "fetch_session_info", AsyncMock(return_value=info)):
+            update = make_update()
+            await tg.cmd_now(update, SimpleNamespace())
+
+        replies = update.message.replies
+        self.assertEqual(len(replies), 2)  # idle agent is not listed
+        first_text, first_kwargs, _ = replies[0]
+        second_text, second_kwargs, _ = replies[1]
+        self.assertIn("⏸ <b>beta</b> · waiting for approval", first_text)   # blocked sorts first
+        self.assertIn("⚙️ <b>alpha</b> · working", second_text)
+        self.assertIn("Context: 217,447 tokens · 22%", second_text)
+        self.assertIn("[•] Backend: portal login", second_text)
+        self.assertIn("[ ] Frontend: feature module", second_text)
+        self.assertIn("Todo 1/3", second_text)
+        for kwargs in (first_kwargs, second_kwargs):
+            buttons = [b.text for b in kwargs["reply_markup"].inline_keyboard[0]]
+            self.assertEqual(buttons, ["⛔ Interrupt", "👁 Details"])
+
+    def test_session_details_truncate_todos_and_hide_unknown_model_pct(self):
+        info = {
+            "context_tokens": 5000, "created_ms": 0, "cost": 1.5,
+            "model_id": "mystery-model",
+            "todos": [{"status": "pending", "content": f"task {i}"} for i in range(9)],
+        }
+        lines = tg.session_details_lines(info)
+        self.assertIn("Context: 5,000 tokens", lines[0])
+        self.assertNotIn("%", lines[0])
+        self.assertIn("$1.50", lines[1])
+        self.assertIn("Todo 0/9", lines)
+        self.assertIn("+3 more", lines)
+        self.assertEqual(tg.session_details_lines(None), [])
+
+    async def test_now_with_nothing_active_says_so(self):
+        tg.relay_connected = True
+        tg.agents = make_agents(2, status="idle")
+        update = make_update()
+
+        await tg.cmd_now(update, SimpleNamespace())
+
+        self.assertEqual(update.message.replies[0][0], "No active sessions.")
+
+    async def test_now_shows_activity_and_branch_from_session_info(self):
+        tg.relay_connected = True
+        tg.agents = make_agents(1, status="working", project="alpha")
+        info = {"activity": "Bash: npm test", "branch": "main", "context_tokens": 0,
+                "todos": [], "cost": 0, "model_id": "", "created_ms": 0}
+        with patch.object(tg, "fetch_session_info", AsyncMock(return_value=info)):
+            update = make_update()
+            await tg.cmd_now(update, SimpleNamespace())
+        text = update.message.replies[0][0]
+        self.assertIn("<code>/work/alpha/0</code> · <i>main</i>", text)
+        self.assertIn("Bash: npm test", text)
+
+    def test_context_line_joins_cwd_and_branch(self):
+        line = tg.context_line("/Users/dmonster/saas/nodehr", "feature/payroll")
+        self.assertEqual(line, "<code>~/saas/nodehr</code> · <i>feature/payroll</i>")
+        self.assertEqual(tg.context_line("", "main"), "<i>main</i>")
+        self.assertEqual(tg.context_line("/w/p", ""), "<code>/w/p</code>")
+
+    async def test_rules_lists_and_deletes(self):
+        tg.relay_connected = True
+        rules = [
+            {"project": "nodehr", "subject": "npm run build"},
+            {"project": "checkwiseweb"},
+        ]
+        with patch.object(tg.approval_rules, "load", return_value=rules), \
+                patch.object(tg.approval_rules, "save") as save:
+            update = make_update()
+            await tg.cmd_rules(update, SimpleNamespace())
+            text, kwargs, _ = update.message.replies[0]
+            self.assertIn("Approval rules (2)", text)
+            self.assertIn("1. nodehr · always · npm run build", text)
+            self.assertIn("2. checkwiseweb · project · all safe actions", text)
+            buttons = [b for row in kwargs["reply_markup"].inline_keyboard for b in row]
+            self.assertEqual([b.text for b in buttons], ["🗑 1", "🗑 2"])
+
+            callback = FakeCallback({"action": "rule_del", "i": 0})
+            await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+            save.assert_called_once_with([{"project": "checkwiseweb"}])
+            self.assertIn("Approval rules (1)", callback.edited_text)
+
+    async def test_finished_card_notes_auto_approvals(self):
+        bot = FakeBot()
+        app = SimpleNamespace(bot=bot)
+        tg.prev_statuses["w0:p1"] = "working"
+        tg.daily_stats["w0:p1"] = {"agent": "opencode", "project": "auto",
+                                   "blocked_count": 0, "working_mins": 0,
+                                   "last_change": 0, "auto_approved": 2}
+        tg.working_cards.pop("w0:p1", None)
+        with patch.object(tg, "read_pane", AsyncMock(return_value="ok")):
+            await tg.track_agent_updates(app, make_agents(1, status="done", project="auto"))
+        self.assertIn("🔇 2 auto-approved by rules", bot.sent[0][1])
 
     async def test_page_callback_rebuilds_from_latest_cache(self):
         tg.relay_connected = True
@@ -764,8 +1131,8 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         chat_id, text, kwargs, sent = bot.sent[0]
         rows = kwargs["reply_markup"].inline_keyboard
         self.assertEqual([json.loads(row[0].callback_data)["k"] for row in rows[:3]], ["1", "2", "3"])
-        self.assertEqual(rows[-1][0].text, "Open output & reply")
-        self.assertIn("reply to this notification", text)
+        self.assertEqual([button.text for button in rows[-1]], ["👁 Details", "💬 Reply"])
+        self.assertNotIn("Use an approval button", text)
         self.assertEqual(tg.pending_pane(chat_id, sent.message_id), "w0:p1")
 
     async def test_group_prompts_keep_independent_pane_mappings(self):
