@@ -145,8 +145,6 @@ function pressCtrl(label) {
   sendKeys(preset.keys);
 }
 
-function toggleArrows(){}
-function hideArrows(){}
 function respond(t){if(!ws||!activePane)return;if(window.cue)cue('success');ws.send(JSON.stringify({type:'respond',pane_id:activePane,text:t}));document.getElementById('quickActions').innerHTML='';setTimeout(refreshPane,500);}
 let imeComposing = false, imeEndedAt = 0;
 {

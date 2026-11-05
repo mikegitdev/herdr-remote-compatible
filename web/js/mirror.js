@@ -835,6 +835,5 @@ function sendText() {
   }
   i.value=''; setTimeout(refreshPane,500);
 }
-function sendKey(k){if(!ws||!activePane)return;ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:[k]}));setTimeout(refreshPane,300);}
 function sendKeys(k){if(!ws||!activePane)return;ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:k}));setTimeout(refreshPane,300);}
 

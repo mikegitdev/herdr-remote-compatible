@@ -4,7 +4,8 @@
 # dependencies = ["websockets>=14.0", "zeroconf>=0.80.0", "pywebpush>=2.0.0", "py-vapid>=1.9.0"]
 # ///
 """herdr-remote relay — polls herdr, accepts push events (HTTP POST + WebSocket + UDP), broadcasts to clients."""
-import asyncio, hashlib, json, logging, os, re, shlex, shutil, signal, socket, subprocess, threading, time
+import asyncio, hashlib, hmac, json, logging, os, re, shlex, shutil, signal, socket, subprocess, threading, time
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     from websockets.asyncio.server import serve
@@ -183,10 +184,13 @@ CHROME_RE = re.compile(
 QUESTION_OPTION_RE = re.compile(
     r"^(?P<cursor>[\uf054>\u203a\u276f\u25b8\u2192])?\s*"
     r"(?:"
-    # omp marks each option with a checkbox/radio/marker glyph ...
-    r"(?P<marker>[\uf046\uf10c\uf192\uf096\uf14a\u25cb\u25c9\u2610\u2611]|\([ o]\)|\[[ xX]\])\s+"
-    # ... while pi numbers them (`❯ 1. Option A`, cursor on the selected row).
-    r"|(?P<num>\d{1,2})\.\s+"
+    # A marker glyph, optionally preceded by a number: omp's bare marker rows
+    # (`○ Red`) and pi's multi-select rows (`❯ 1. [ ] Purge everything`) share it
+    # -- without the optional number pi's checkbox lands inside the label and
+    # the free-text row stops matching QUESTION_OTHER_PI.
+    r"(?:\d{1,2}\.\s*)?(?P<marker>[\uf046\uf10c\uf192\uf096\uf14a\u25cb\u25c9\u2610\u2611]|\([ o]\)|\[[ xX\u2713\u2714]\])\s+"
+    # ... while a single-select pi row is just numbered (`❯ 1. Option A`).
+    r"|\d{1,2}\.\s+"
     r")"
     r"(?P<label>.+?)\s*$"
 )
@@ -234,6 +238,40 @@ known_panes = set()
 # match and no `agent focus` to call.
 shell_pane_map = {}
 agent_cache = {}
+# Pane ids two hosts report at once. Every herdr numbers its own panes (w11:p1 exists on any host
+# that has had eleven workspaces), and the maps above are keyed by bare pane id, so a command for
+# one of these could land on either machine. Refused rather than guessed -- see resolve_space for
+# the same rule over workspace and tab ids.
+ambiguous_panes = set()
+
+# --- Per-host poll state ---
+#
+# A failed `pane list` used to read as "this host has no panes": the stale sweep then forgot every
+# pane on it -- unread state, blocked-prompt fingerprints and all -- so one SSH timeout made its
+# agents blink out of every client and re-fired the push for each one blocked on it when it came
+# back. A failure now keeps the host's last good list for HOST_STALE_AFTER, which is what decides
+# when a host that stays down is believed gone, and a remote that keeps failing is retried on a
+# backoff instead of costing every poll its connect timeout.
+HOST_STALE_AFTER = 60
+HOST_BACKOFF_MAX = 60
+host_state = {}  # host label -> {ok, failures, retry_at, last_ok, last_ok_at, agents, shells}
+_host_state_guard = threading.Lock()
+# What a connecting client is handed without a single herdr call: the last full `agents` message
+# the poll built, and the blocked prompt last broadcast for each pane still blocked.
+last_snapshot = None
+last_blocked_messages = {}
+# The last `agents` payload sent, so an unchanged poll is not re-sent to every phone every 2s.
+# AGENTS_HEARTBEAT still re-sends it: the Telegram bot runs its approval nudge and its working-card
+# refresh off each `agents` message, and an idle herd would otherwise never trigger either.
+AGENTS_HEARTBEAT = 20
+_last_agents_sent = {"data": None, "at": 0.0}
+# A client that has stopped reading: its send is abandoned and its connection aborted, so it
+# cannot hold every other client's broadcast (and the poll behind it) hostage.
+BROADCAST_SEND_TIMEOUT = 10
+# For /healthz: when the poll last completed, and the long-lived tasks main() started.
+STARTED_AT = time.monotonic()
+last_poll_at = None
+background_tasks = {}
 # The tab/workspace hierarchy as herdr reports it, refreshed on its own slower cadence (see
 # SPACES_POLL_INTERVAL) and immediately after anything that changes it. `(host, id) -> remote`,
 # because ids are only unique within one herdr: every host numbers its own workspaces w1, w2, ...
@@ -909,10 +947,12 @@ def list_panes_from_host(remote=None):
     host_label = remote or "local"
     try:
         data = json.loads(raw)
-        panes = data.get("result", {}).get("panes", [])
+        if not isinstance(data, dict) or not isinstance(data.get("result"), dict):
+            return None     # no answer, or not a pane list: unreachable, not empty
+        panes = data["result"].get("panes", [])
         workspace_labels = get_workspace_labels(remote=remote) if panes else {}
     except (json.JSONDecodeError, KeyError):
-        return [], []
+        return None
 
     agents, shells = [], []
     for p in panes:
@@ -1067,17 +1107,79 @@ def focus_shell_pane(pane_id, tab_id, remote=None):
     return False
 
 
-def get_agents_from_host(remote=None):
-    return list_panes_from_host(remote=remote)[0]
+def poll_host(remote=None):
+    """(agents, shells) for one host, riding out a failed read on its last good list. BLOCKING.
+
+    A remote that failed is not dialled again until its backoff expires (4s, 8s, ... up to
+    HOST_BACKOFF_MAX), so a dead host costs the poll nothing instead of its connect timeout
+    every cycle. The local host is always re-read: a local failure is cheap and a restarted
+    herdr should show up on the next tick.
+    """
+    label = remote or "local"
+    gen = POLL_GENERATION
+    now = time.monotonic()
+    with _host_state_guard:
+        state = host_state.setdefault(label, {
+            "ok": None, "failures": 0, "retry_at": 0.0, "last_ok": None, "down_since": None,
+            "agents": [], "shells": [],
+        })
+        backing_off = remote is not None and now < state["retry_at"]
+    result = None if backing_off else list_panes_from_host(remote=remote)
+    with _host_state_guard:
+        if gen != POLL_GENERATION:
+            # A session switch landed mid-read: this list belongs to the old session and must
+            # not become the new one's "last good".
+            return result or ([], [])
+        if result is not None:
+            if state["failures"]:
+                log.info("host %s: pane list answering again after %d failure(s)", label, state["failures"])
+            state.update(ok=True, failures=0, retry_at=0.0, last_ok=now, down_since=None,
+                         agents=result[0], shells=result[1])
+            return result
+        if not backing_off:
+            state["ok"] = False
+            state["failures"] += 1
+            state["down_since"] = state["down_since"] or int(time.time() * 1000)
+            state["retry_at"] = now + min(HOST_BACKOFF_MAX, POLL_INTERVAL * 2 ** state["failures"])
+            if state["failures"] == 1:
+                log.warning("host %s: pane list failed; keeping its last good list for %ds",
+                            label, HOST_STALE_AFTER)
+        if state["last_ok"] is not None and now - state["last_ok"] < HOST_STALE_AFTER:
+            # Copies: stamp_activity and update_pane_maps write into these dicts.
+            return [dict(a) for a in state["agents"]], [dict(s) for s in state["shells"]]
+        return [], []
 
 
 def get_all_panes():
-    agents, shells = list_panes_from_host(remote=None)
-    for remote in REMOTES:
-        more_agents, more_shells = list_panes_from_host(remote=remote)
+    """Every host's panes, read in parallel -- one slow remote no longer delays the others."""
+    sources = [None, *REMOTES]
+    if len(sources) == 1:
+        results = [poll_host(None)]
+    else:
+        with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+            results = list(pool.map(poll_host, sources))
+    agents, shells = [], []
+    for more_agents, more_shells in results:
         agents.extend(more_agents)
         shells.extend(more_shells)
     return agents, shells
+
+
+def host_health():
+    """Per-host reachability for the `agents` message, local first then REMOTES order.
+
+    Only fields that change when the host's state does: a per-poll timestamp here would make
+    every snapshot differ and defeat broadcast_agents' dedupe. `down_since` is epoch ms.
+    """
+    out = []
+    with _host_state_guard:
+        for source in [None, *REMOTES]:
+            state = host_state.get(source or "local")
+            if state is None or state["ok"] is None:
+                continue    # not polled yet
+            out.append({"host": source or "local", "ok": state["ok"],
+                        "down_since": state["down_since"]})
+    return out
 
 
 def get_all_agents():
@@ -1138,6 +1240,16 @@ def update_pane_maps(agents, shells=()):
         activity_ensure(pane.get("host", "local"), pane_id)
     activity_note_statuses(agents)
 
+    hosts_by_pane = {}
+    for pane in [*agents, *(shells or shell_pane_map.values())]:
+        hosts_by_pane.setdefault(pane["pane_id"], set()).add(pane.get("host", "local"))
+    ambiguous = {pane_id for pane_id, hosts in hosts_by_pane.items() if len(hosts) > 1}
+    for pane_id in sorted(ambiguous - ambiguous_panes):
+        log.warning("pane %s is reported by %s; refusing commands for it rather than guessing a host",
+                    pane_id, ", ".join(sorted(hosts_by_pane[pane_id])))
+    ambiguous_panes.clear()
+    ambiguous_panes.update(ambiguous)
+
     stale = known_panes - current_pane_ids
     if stale:
         known_panes.difference_update(stale)
@@ -1151,6 +1263,7 @@ def update_pane_maps(agents, shells=()):
             pane_session_map.pop(pane_id, None)
             last_statuses.pop(pane_id, None)
             last_blocked_prompts.pop(pane_id, None)
+            last_blocked_messages.pop(pane_id, None)
             agent_cache.pop(pane_id, None)
             shell_pane_map.pop(pane_id, None)
     # Last, so the records carry whatever this call just seeded or bumped.
@@ -1177,13 +1290,21 @@ def reset_pane_state():
     and displayed against a freshly read session list, never a pre-switch
     one still inside its TTL.
     """
-    global POLL_GENERATION
+    global POLL_GENERATION, last_snapshot
     known_panes.clear()
     agent_cache.clear()
     pane_remote_map.clear()
     last_statuses.clear()
     last_blocked_prompts.clear()
+    last_blocked_messages.clear()
+    ambiguous_panes.clear()
     _session_list_cache.clear()
+    # Every cached pane list is the old session's: a "last good" list served after the switch
+    # would put its panes back on screen, and the next connect would be handed them too.
+    with _host_state_guard:
+        host_state.clear()
+    last_snapshot = None
+    _last_agents_sent["data"] = None
     while True:
         try:
             event_queue.get_nowait()
@@ -1513,14 +1634,14 @@ def detect_question(text):
         match = QUESTION_OPTION_RE.match(line)
         if not match:
             if current:
-                # An indented non-matching line between matching ones is a
-                # pi option's description ("     Proceed with option A ...")
-                # and belongs to the block; anything else closes it.
-                next_line = (
-                    lines[line_index + 1].strip().strip("\u2502|").strip()
-                    if line_index + 1 < len(lines) else ""
-                )
-                if line and raw_line[:1].isspace() and QUESTION_OPTION_RE.match(next_line):
+                # An indented non-matching line while the block is open is an
+                # option's description (pi renders it under the row, and it can
+                # wrap); attach it to the row above. A blank or non-indented
+                # line closes the block.
+                if line and raw_line[:1].isspace():
+                    current[-1]["detail"] = (
+                        f"{current[-1].get('detail') or ''} {line}".strip()
+                    )
                     continue
                 blocks.append((current_start, current))
                 current = []
@@ -1532,8 +1653,9 @@ def detect_question(text):
         current.append({
             "label": match.group("label").strip(),
             "selected": bool(match.group("cursor")),
-            "multi": marker in {"\uf046", "\uf096", "\uf14a", "\u2610", "\u2611", "[ ]", "[x]", "[X]"},
-            "checked": marker in {"\uf046", "\uf14a", "\u2611", "[x]", "[X]"},
+            "multi": marker in {"\uf046", "\uf096", "\uf14a", "\u2610", "\u2611", "[ ]", "[x]", "[X]", "[\u2713]", "[\u2714]"},
+            "checked": marker in {"\uf046", "\uf14a", "\u2611", "[x]", "[X]", "[\u2713]", "[\u2714]"},
+            "detail": "",
         })
     if current:
         blocks.append((current_start, current))
@@ -1568,7 +1690,13 @@ def detect_question(text):
                         break
                     continue
                 question_lines.append(line)
-            question_text = " ".join(reversed(question_lines))
+            ordered = list(reversed(question_lines))
+            # pi echoes the questionnaire tool above the dialog as
+            # "Ask <Header>" right above the header itself; both survive the
+            # blank-stripped walk and read as internal data, so drop the echo.
+            if len(ordered) >= 2 and ordered[0] == f"Ask {ordered[1]}":
+                ordered.pop(0)
+            question_text = " ".join(ordered)
             return {
                 "options": block,
                 "selected_index": next(
@@ -1712,7 +1840,21 @@ def blocked_message(pane_id, agent, project, host, content, cwd=""):
     elif oc_permission:
         options = OPENCODE_OPTIONS
     else:
-        options = detect_options(content) if agent in ("omp", "pi") else detect_approval_options(content)
+        if question is not None:
+            # Structured rows straight off the parsed block: labels paired with
+            # their descriptions, so a client renders a question card without
+            # mining the raw prompt tail.
+            rows = [
+                option for option in question["options"]
+                if option["label"] not in (QUESTION_OTHER, QUESTION_OTHER_PI)
+                and "Done selecting" not in option["label"]
+            ]
+            options = [option["label"] for option in rows]
+        else:
+            options = (
+                detect_options(content) if agent in ("omp", "pi")
+                else detect_approval_options(content)
+            )
     if oc_question is not None or oc_review or oc_permission:
         # Every opencode dialog takes an Esc; carrying it in `options` means the
         # web client gets the button from the same message Telegram does.
@@ -1744,6 +1886,11 @@ def blocked_message(pane_id, agent, project, host, content, cwd=""):
         "multi": bool(question and question["multi"]),
         "update": False,
     }
+    if question is not None:
+        # The structured half of the card: clean question text (echo stripped)
+        # and per-option descriptions aligned with multi_options.
+        message["question_text"] = question["text"]
+        message["multi_details"] = [option.get("detail", "") for option in rows]
     if oc_permission:
         extracted = extract_permission_detail(content)
         if extracted:
@@ -2149,6 +2296,14 @@ def submit_multi_question(pane_id, remote=None):
         if not move_question_cursor(pane_id, question, done_index, remote=remote):
             return False
         return _mutate_herdr("pane", "send-keys", pane_id, "Enter", remote=remote)
+    if question["multi"] and any(box in content for box in ("[ ]", "[\u2713]", "[\u2714]")):
+        # pi's multi-select: a plain Submit row sits directly below the last
+        # numbered option (Enter toggles a row, it does not submit). Keyed on
+        # the literal checkbox forms -- pi's `Space to toggle` hint lives in a
+        # line CHROME_RE strips from read_pane, so the content here never sees it.
+        if not move_question_cursor(pane_id, question, len(question["options"]), remote=remote):
+            return False
+        return _mutate_herdr("pane", "send-keys", pane_id, "Enter", remote=remote)
     if "Submit" in content and any(
         marker in content for marker in ("\uf14a", "\uf046", "\u2611", "[x]", "[X]")
     ):
@@ -2192,29 +2347,64 @@ def respond_to_question(pane_id, text, question, remote=None):
     )
 
 
+async def _deliver(ws, data):
+    """Send to one client; False when it is gone or has stopped reading."""
+    try:
+        await asyncio.wait_for(ws.send(data), BROADCAST_SEND_TIMEOUT)
+    except asyncio.TimeoutError:
+        # Its write buffer has been full for the whole timeout. Abandoning the send leaves the
+        # connection unusable, so abort it; its handler then sees the close and cleans up.
+        log.warning("Dropping a client that stopped reading for %ds", BROADCAST_SEND_TIMEOUT)
+        transport = getattr(ws, "transport", None)
+        if transport is not None:
+            transport.abort()
+        return False
+    except Exception:
+        return False
+    return True
+
+
 async def broadcast(msg):
+    """Send to every client at once. One after another, a single phone on a stalled link held
+    every other client -- and the poll loop awaiting this -- until its ping timed out."""
     data = json.dumps(msg)
-    dead = set()
-    for ws in list(clients):
-        try:
-            await ws.send(data)
-        except (ConnectionClosedError, ConnectionClosedOK):
-            dead.add(ws)
-        except Exception:
-            dead.add(ws)
+    targets = list(clients)
+    delivered = await asyncio.gather(*(_deliver(ws, data) for ws in targets))
+    dead = {ws for ws, ok in zip(targets, delivered) if not ok}
     if dead:
         log.debug("Removed %d dead client(s)", len(dead))
     clients.difference_update(dead)
 
+
+async def broadcast_agents(message, dedupe=False):
+    """Broadcast an `agents` message; with `dedupe`, skip it when nothing changed since the last
+    one -- unless AGENTS_HEARTBEAT has passed, which keeps time-driven client logic ticking."""
+    data = json.dumps(message)
+    now = time.monotonic()
+    if (dedupe and data == _last_agents_sent["data"]
+            and now - _last_agents_sent["at"] < AGENTS_HEARTBEAT):
+        return
+    _last_agents_sent.update(data=data, at=now)
+    await broadcast(message)
+
 async def send_current_snapshot(ws):
     await ws.send(json.dumps(await asyncio.to_thread(sessions_message)))
+    if last_snapshot is not None:
+        # The poll rebuilds this every POLL_INTERVAL, so it is at most one tick old -- and serving
+        # it costs no herdr call. Reading live here made every connect a full poll of every host
+        # plus a pane read per blocked agent, so a reconnect storm after a restart or a tunnel
+        # flap became one fan-out per client, each waiting on the slowest host.
+        await ws.send(json.dumps({**last_snapshot, "hosts": host_health()}))
+        for message in list(last_blocked_messages.values()):
+            await ws.send(json.dumps({**message, "update": False}))
+        return
     agents, shells = await asyncio.to_thread(get_all_panes)
     update_pane_maps(agents, shells)
     # Force the hierarchy read: a client that just connected has no chip strip at all, and
     # waiting out the slow cadence would show it agents filed under ids for a few seconds.
     spaces = await asyncio.to_thread(refresh_spaces, force=True)
-    await ws.send(json.dumps(
-        {"type": "agents", "agents": agents, "spaces": spaces, "panes": shells}))
+    await ws.send(json.dumps({"type": "agents", "agents": agents, "spaces": spaces,
+                              "panes": shells, "hosts": host_health()}))
     for agent in agents:
         if agent["status"] != "blocked":
             continue
@@ -2246,15 +2436,20 @@ async def poll_loop():
 
 
 async def _poll_once():
+        global last_snapshot, last_poll_at
         gen = POLL_GENERATION
         agents, shells = await asyncio.to_thread(get_all_panes)
         update_pane_maps(agents, shells)
-        # Always broadcast (even empty list) so clients stay in sync
         spaces = await asyncio.to_thread(refresh_spaces)
-        await broadcast(
-            {"type": "agents", "agents": agents, "spaces": spaces, "panes": shells})
+        snapshot = {"type": "agents", "agents": agents, "spaces": spaces, "panes": shells,
+                    "hosts": host_health()}
+        # Broadcast even an empty list so clients stay in sync -- but not the same list twice in
+        # a row; see AGENTS_HEARTBEAT.
+        await broadcast_agents(snapshot, dedupe=True)
         if gen != POLL_GENERATION:
             return          # a switch landed; this snapshot is stale
+        last_snapshot = snapshot
+        last_poll_at = time.monotonic()
         for a in agents:
             pid, status = a["pane_id"], a["status"]
             if status == "blocked":
@@ -2280,6 +2475,7 @@ async def _poll_once():
                     message["branch"] = await asyncio.to_thread(
                         git_branch, a.get("cwd", "")) if a.get("cwd") else ""
                     last_blocked_prompts[pid] = fingerprint
+                    last_blocked_messages[pid] = message
                     await broadcast(message)
                     await send_web_push(
                         title=f"\U0001f411 {a['project']} blocked",
@@ -2294,76 +2490,93 @@ async def _poll_once():
                     if gen != POLL_GENERATION:
                         return
                 last_blocked_prompts.pop(pid, None)
+                last_blocked_messages.pop(pid, None)
             last_statuses[pid] = status
 async def event_push():
+    """Drain pushed events forever. A bad event is logged and dropped: this task used to end on
+    the first one that raised (a UDP datagram that was valid JSON but not an object was enough),
+    leaving the relay silently poll-only until restarted."""
     while True:
         event = await event_queue.get()
-        gen = POLL_GENERATION
-        pane_id = event.get("pane_id", "")
-        update = None
-        if pane_id and event.get("type") == "agent_event":
-            update = complete_agent_update_message(
-                event,
-                current=agent_cache.get(pane_id),
-                local_hostname=socket.gethostname(),
-            )
-            if update is None:
-                continue
-        agent_data = update["agent"] if update else event
-        status = agent_data.get("status", "")
-        host = agent_data.get("host", "local")
-        event_remote = pane_remote_map.get(pane_id)
+        try:
+            await _push_event(event)
+        except Exception:
+            log.exception("push event failed; dropped: %.200r", event)
 
-        if pane_id and event.get("type") == "agent_event":
-            agents, shells = await asyncio.to_thread(get_all_panes)
-            if status == "blocked" and not any(
-                agent["pane_id"] == pane_id for agent in agents
-            ):
-                agents.append({
-                    "pane_id": pane_id,
-                    "agent": agent_data.get("agent", ""),
-                    "status": status,
-                    "cwd": agent_data.get("cwd", ""),
-                    "project": agent_data.get("project", ""),
-                    "host": host,
-                    "remote": event_remote,
-                })
-            update_pane_maps(agents, shells)
-            await broadcast({"type": "agents", "agents": agents, "panes": shells})
-            if gen != POLL_GENERATION:
-                continue        # a switch landed; this event is stale
-            agent_cache[pane_id] = {**agent_cache.get(pane_id, {}), **agent_data}
-            if status != "blocked":
-                await broadcast(update)
 
-        if status == "blocked" and pane_id:
-            remote = pane_remote_map.get(pane_id)
-            if remote or host == "local":
-                content = await asyncio.to_thread(read_pane, pane_id, remote=remote)
-            else:
-                content = event.get("prompt", "Agent is blocked")
-            message = blocked_message(
-                pane_id,
-                agent_data.get("agent", ""),
-                agent_data.get("project", ""),
-                host,
-                content or agent_data.get("prompt", "Agent is blocked"),
-                cwd=agent_data.get("cwd", ""),
-            )
-            # Unreachable with a mismatch today: whichever branch got here
-            # did so with no await since the last gen check (the "agents"
-            # broadcast above already `continue`s on staleness before this
-            # point, and read_pane/blocked_message are synchronous), so gen
-            # cannot have changed. Kept as a guard for a future refactor
-            # that inserts an await between this check and the writes below.
-            if gen != POLL_GENERATION:
-                continue        # a switch landed; this event is stale
-            last_blocked_prompts[pane_id] = (
-                message["prompt_id"],
-                tuple(message["selected_options"]),
-                message["prompt"],
-            )
-            await broadcast(message)
+async def _push_event(event):
+    if not isinstance(event, dict):
+        return
+    gen = POLL_GENERATION
+    pane_id = event.get("pane_id", "")
+    if not isinstance(pane_id, str):
+        return
+    update = None
+    if pane_id and event.get("type") == "agent_event":
+        update = complete_agent_update_message(
+            event,
+            current=agent_cache.get(pane_id),
+            local_hostname=socket.gethostname(),
+        )
+        if update is None:
+            return
+    agent_data = update["agent"] if update else event
+    status = agent_data.get("status", "")
+    host = agent_data.get("host", "local")
+    event_remote = pane_remote_map.get(pane_id)
+
+    if pane_id and event.get("type") == "agent_event":
+        agents, shells = await asyncio.to_thread(get_all_panes)
+        if status == "blocked" and not any(
+            agent["pane_id"] == pane_id for agent in agents
+        ):
+            agents.append({
+                "pane_id": pane_id,
+                "agent": agent_data.get("agent", ""),
+                "status": status,
+                "cwd": agent_data.get("cwd", ""),
+                "project": agent_data.get("project", ""),
+                "host": host,
+                "remote": event_remote,
+            })
+        update_pane_maps(agents, shells)
+        await broadcast_agents({"type": "agents", "agents": agents, "panes": shells,
+                                "hosts": host_health()})
+        if gen != POLL_GENERATION:
+            return          # a switch landed; this event is stale
+        agent_cache[pane_id] = {**agent_cache.get(pane_id, {}), **agent_data}
+        if status != "blocked":
+            await broadcast(update)
+
+    if status == "blocked" and pane_id:
+        remote = pane_remote_map.get(pane_id)
+        if remote or host == "local":
+            content = await asyncio.to_thread(read_pane, pane_id, remote=remote)
+        else:
+            content = event.get("prompt", "Agent is blocked")
+        message = blocked_message(
+            pane_id,
+            agent_data.get("agent", ""),
+            agent_data.get("project", ""),
+            host,
+            content or agent_data.get("prompt", "Agent is blocked"),
+            cwd=agent_data.get("cwd", ""),
+        )
+        # Unreachable with a mismatch today: whichever branch got here
+        # did so with no await since the last gen check (the "agents"
+        # broadcast above already returns on staleness before this
+        # point, and read_pane/blocked_message are synchronous), so gen
+        # cannot have changed. Kept as a guard for a future refactor
+        # that inserts an await between this check and the writes below.
+        if gen != POLL_GENERATION:
+            return          # a switch landed; this event is stale
+        last_blocked_prompts[pane_id] = (
+            message["prompt_id"],
+            tuple(message["selected_options"]),
+            message["prompt"],
+        )
+        last_blocked_messages[pane_id] = message
+        await broadcast(message)
 
 
 WEB_DIR = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web"))
@@ -2421,12 +2634,44 @@ def web_asset(request_path):
     return resolved, content_type, cache_control
 
 
+FORWARDING_HEADERS = {"cf-connecting-ip", "cf-ray", "x-forwarded-for", "forwarded", "x-real-ip"}
+HEALTH_POLL_STALE = 30
+
+
+def direct_local_request(connection, request):
+    """True for a request from this machine that no proxy (cloudflared included) relayed."""
+    address = getattr(connection, "remote_address", None)
+    if not address or address[0] not in {"127.0.0.1", "::1", "::ffff:127.0.0.1"}:
+        return False
+    return not any(key.lower() in FORWARDING_HEADERS for key, _ in request.headers.raw_items())
+
+
+def health_report():
+    """(HTTP status, body) for /healthz: 503 when the poll has stalled or a core task has died.
+
+    Public, so it names no host: an uptime check needs "is it alive", not the SSH targets.
+    """
+    poll_age = None if last_poll_at is None else round(time.monotonic() - last_poll_at, 1)
+    dead = sorted(name for name, task in background_tasks.items() if task.done())
+    hosts = host_health()
+    healthy = not dead and poll_age is not None and poll_age < HEALTH_POLL_STALE
+    return (200 if healthy else 503), {
+        "ok": healthy,
+        "uptime_s": int(time.monotonic() - STARTED_AT),
+        "poll_age_s": poll_age,
+        "tasks_down": dead,
+        "hosts": len(hosts),
+        "hosts_down": sum(not host["ok"] for host in hosts),
+        "clients": len(clients),
+    }
+
+
 async def process_request(connection, request):
     """Handle HTTP POST on the same port as WebSocket."""
     from websockets.http11 import Response
     from websockets.datastructures import Headers
 
-    public_paths = {"/sw.js", "/api/vapid-public-key"}
+    public_paths = {"/sw.js", "/api/vapid-public-key", "/healthz"}
     request_path = (request.path or "/").split("?", 1)[0]
 
     # Token auth (if configured). Static assets under web/ are exempt because a browser fetches
@@ -2444,7 +2689,9 @@ async def process_request(connection, request):
             _, qs = request.path.split("?", 1) if "?" in request.path else (request.path, "")
             params = urllib.parse.parse_qs(qs)
             token = params.get("token", [None])[0]
-        if token != AUTH_TOKEN:
+        # Constant-time, and on bytes: compare_digest refuses a str holding non-ASCII, which a
+        # caller controls.
+        if not hmac.compare_digest((token or "").encode(), AUTH_TOKEN.encode()):
             headers = Headers([("Content-Type", "text/plain")])
             return Response(401, "Unauthorized", headers, b"Invalid token\n")
 
@@ -2483,8 +2730,18 @@ async def process_request(connection, request):
         _, qs = (request.path or "").split("?", 1)
         params = _urlparse.parse_qs(qs)
         if "d" in params:
+            # With a token set, the check above already required it. Without one, only a caller
+            # on this machine may push: a pushed blocked event carries its own prompt text, so
+            # anyone who could reach the tunnel could otherwise put a fake approval in front of
+            # the operator. cloudflared connects from loopback too, hence the header check.
+            if not AUTH_TOKEN and not direct_local_request(connection, request):
+                log.warning("push: refused an event from beyond this machine")
+                headers = Headers([("Content-Type", "text/plain")])
+                return Response(403, "Forbidden", headers, b"Events are accepted from this machine only\n")
             try:
                 event = json.loads(params["d"][0])  # parse_qs already decodes
+                if not isinstance(event, dict):
+                    raise ValueError("not a JSON object")
                 event_queue.put_nowait(event)
                 log.debug("push: received event type=%s", event.get("type", "unknown"))
             except Exception as e:
@@ -2521,6 +2778,12 @@ async def process_request(connection, request):
             return Response(200, "OK", headers, body)
 
     # Serve VAPID public key
+    if path == "/healthz":
+        status, body = health_report()
+        headers = Headers([("Content-Type", "application/json"), ("Cache-Control", "no-store")])
+        return Response(status, "OK" if status == 200 else "Service Unavailable", headers,
+                        json.dumps(body).encode())
+
     if path == "/api/vapid-public-key":
         body = json.dumps({"publicKey": VAPID_PUBLIC_KEY}).encode()
         headers = Headers([
@@ -2553,6 +2816,22 @@ async def process_request(connection, request):
     # Fallback for unmatched paths
     headers = Headers([("Access-Control-Allow-Origin", "*")])
     return Response(404, "Not Found", headers, b"not found\n")
+
+
+def error_reply(msg, message):
+    """An `error` answering one client message, correlated by its request_id when it sent one."""
+    reply = {"type": "error", "message": message}
+    if isinstance(msg, dict) and msg.get("request_id"):
+        reply["request_id"] = msg["request_id"]
+    return reply
+
+
+def command_reply(msg, command, ok, **extra):
+    """The `command_result` every mutating command answers with, carrying the caller's request_id."""
+    reply = {"type": "command_result", "command": command, "ok": bool(ok), **extra}
+    if isinstance(msg, dict) and msg.get("request_id"):
+        reply["request_id"] = msg["request_id"]
+    return reply
 
 
 async def handle_client(ws):
@@ -2589,519 +2868,576 @@ async def handle_client(ws):
     try:
         if not command_connection:
             await send_current_snapshot(ws)
-        async for raw in ws:
+        msg = None
+        while True:
             try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            msg_type = msg.get("type")
-            # One place, ahead of every handler, so a new one cannot forget to clear a pane's unread
-            # state (see SEEN_ON). Ahead of validation too: a client that named a known pane did
-            # look at it, whatever the rest of the message turns out to be.
-            if msg_type in SEEN_ON:
-                activity_note_seen(msg.get("pane_id", ""))
-            if msg_type == "question_toggle":
-                pane_id = msg["pane_id"]
-                option = msg.get("option", "")
-                if pane_id not in known_panes or not option:
-                    await ws.send(json.dumps({"type": "error", "message": "invalid question option"}))
-                    continue
-                remote = pane_remote_map.get(pane_id)
-                if not await asyncio.to_thread(
-                    prompt_matches, pane_id, msg.get("prompt_id", ""), remote=remote
-                ):
-                    await ws.send(json.dumps({"type": "error", "message": "question changed; refresh and try again"}))
-                    continue
-                if not await asyncio.to_thread(toggle_question_option, pane_id, option, remote=remote):
-                    await ws.send(json.dumps({"type": "error", "message": "question option toggle failed"}))
-            elif msg_type == "question_submit":
-                pane_id = msg["pane_id"]
-                if pane_id not in known_panes:
-                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
-                    continue
-                remote = pane_remote_map.get(pane_id)
-                if not await asyncio.to_thread(
-                    prompt_matches, pane_id, msg.get("prompt_id", ""), remote=remote
-                ):
-                    await ws.send(json.dumps({"type": "error", "message": "question changed; refresh and try again"}))
-                    continue
-                if not await asyncio.to_thread(submit_multi_question, pane_id, remote=remote):
-                    await ws.send(json.dumps({"type": "error", "message": "question submission failed"}))
-            elif msg_type == "respond":
-                pane_id = msg["pane_id"]
-                request_id = msg.get("request_id")
-
-                def command_error(message):
-                    response = {"type": "error", "message": message}
-                    if request_id:
-                        response["request_id"] = request_id
-                    return response
-
-                if pane_id not in known_panes:
-                    await ws.send(json.dumps(command_error("unknown pane_id")))
-                    continue
-                text = msg.get("text", "").strip()
-                if not text or len(text) > 1000:
-                    await ws.send(json.dumps(command_error("response empty or too long")))
-                    continue
-                remote = pane_remote_map.get(pane_id)
-                if pane_id in shell_pane_map:
-                    # A shell pane has no question to detect, no approval options to match and no
-                    # harness to refuse a bad answer: the text IS a command and Enter runs it.
-                    # That is what HERDR_SHELL_PANES buys and why it is off by default. The
-                    # question guard below would refuse every one of these, so it is skipped
-                    # rather than tricked -- and the audit line says which kind of pane it was.
-                    log.info("Shell command from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
-                    audit("respond_shell", ip, device, pane_id, f"text={text!r}")
-                    delivered = await asyncio.to_thread(
-                        _mutate_herdr, "pane", "send-text", pane_id, text, remote=remote
-                    ) and await asyncio.to_thread(
-                        _mutate_herdr, "pane", "send-keys", pane_id, "Enter", remote=remote
-                    )
-                    await ws.send(json.dumps(
-                        {"type": "command_result", "command": "respond", "ok": bool(delivered),
-                         **({"request_id": request_id} if request_id else {})}))
-                    continue
-                content = await asyncio.to_thread(read_pane, pane_id, remote=remote)
-                if question_prompt_id(pane_id, content) != msg.get("prompt_id", ""):
-                    await ws.send(json.dumps(command_error("prompt changed; refresh and try again")))
-                    continue
-                question = (
-                    detect_question(content)
-                    if await asyncio.to_thread(pane_is_omp, pane_id, remote=remote)
-                    else None
-                )
-                log.info("Response from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
-                audit("respond", ip, device, pane_id, f"text={text!r}")
-                if question:
-                    delivered = await asyncio.to_thread(
-                        respond_to_question, pane_id, text, question, remote=remote
-                    )
-                elif await asyncio.to_thread(
-                    respond_opencode_dismiss, pane_id, text, content, remote=remote
-                ):
-                    delivered = True
-                elif await asyncio.to_thread(
-                    respond_opencode_permission, pane_id, text, content, remote=remote
-                ):
-                    delivered = True
-                elif await asyncio.to_thread(
-                    respond_opencode_question, pane_id, text, content, remote=remote
-                ):
-                    delivered = True
-                elif await asyncio.to_thread(
-                    respond_opencode_review, pane_id, text, content, remote=remote
-                ):
-                    delivered = True
-                elif custom_editor_active(content) or text.lower() in SAFE_RESPONSES:
-                    delivered = await asyncio.to_thread(
-                        _mutate_herdr, "pane", "send-text", pane_id, text, remote=remote
-                    ) and await asyncio.to_thread(
-                        _mutate_herdr, "pane", "send-keys", pane_id, "Enter", remote=remote
-                    )
-                else:
-                    await ws.send(json.dumps({
-                        **command_error("free-text response requires a detected question"),
-                    }))
-                    continue
-                if not delivered:
-                    await ws.send(json.dumps(command_error("response delivery failed")))
-                    continue
-                response = {"type": "command_result", "command": "respond", "ok": True}
-                if request_id:
-                    response["request_id"] = request_id
-                await ws.send(json.dumps(response))
-            elif msg_type == "session_switch":
-                request_id = msg.get("request_id")
-                # The allowlist read is one `herdr session list` per call -- an ssh round trip
-                # for a remote -- so it goes to a worker thread. The mutation stays here: it
-                # drains an asyncio.Queue and bumps POLL_GENERATION, neither safe off the loop.
-                names = await asyncio.to_thread(session_switch_names, msg.get("host"))
-                ok, err, changed = apply_session_switch(
-                    msg.get("host"), msg.get("session"), ip, device, names=names
-                )
-                if not ok:
-                    response = {"type": "error", "message": err}
-                    if request_id:
-                        response["request_id"] = request_id
-                    await ws.send(json.dumps(response))
-                else:
-                    # A no-op switch (already-active selection) still acks,
-                    # but must skip the broadcast and re-poll -- that's the
-                    # expensive part `changed` exists to let us avoid.
-                    if changed:
-                        await broadcast_sessions()
-                    if request_id:
-                        await ws.send(json.dumps({
-                            "type": "command_result",
-                            "command": "session_switch",
-                            "request_id": request_id,
-                            "ok": True,
-                        }))
-                    if changed:
-                        try:
-                            await _poll_once()
-                        except Exception:
-                            log.exception("post-switch poll failed")
-            elif msg_type == "agent_event":
-                event_queue.put_nowait(msg)
-            elif msg_type == "read_pane":
-                pane_id = msg["pane_id"]
-                if pane_id not in known_panes:
-                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
-                    continue
-                read_format = msg.get("format", "text")
-                if read_format not in {"text", "ansi"}:
-                    await ws.send(json.dumps({"type": "error", "message": "invalid pane read format"}))
-                    continue
-                # herdr clamps pane.read at ~1000 lines and does not say so (`truncated` stays
-                # true either way): 999/1000/1500/5000 all came back with the same 1000 rows.
-                # Asking for more only buys a bigger request, so refuse to pretend.
-                try:
-                    lines = max(1, min(int(msg.get("lines", 30)), MAX_READ_LINES))
-                except (TypeError, ValueError):
-                    await ws.send(json.dumps({"type": "error", "message": "invalid pane read lines"}))
-                    continue
-                # Clients pick the source: `visible` for a live mirror poll (free, viewport only),
-                # `recent`/`recent-unwrapped` when the user explicitly asks for scrollback. Note
-                # `recent` + text on an alt-screen agent pane is the multi-second harvest that
-                # scrolls the operator's terminal (see PROMPT_READ_SOURCE) -- it is allowed here
-                # because it is user-initiated, not because it is cheap.
-                read_source = str(msg.get("source", "recent")).replace("_", "-")
-                if read_source not in READ_SOURCES:
-                    await ws.send(json.dumps({"type": "error", "message": "invalid pane read source"}))
-                    continue
-                remote = pane_remote_map.get(pane_id)
-                content = await asyncio.to_thread(
-                    run_herdr,
-                    "pane", "read", pane_id, "--lines", str(lines), "--source", read_source,
-                    "--format", read_format, remote=remote
-                )
-                reply = {"type": "pane_content", "pane_id": pane_id, "content": content}
-                if msg.get("process"):
-                    # One extra CLI call, so it is asked for rather than always sent: a client
-                    # wants it when it OPENS a pane, not on every mirror refresh.
-                    reply["process"] = await asyncio.to_thread(
-                        pane_process, pane_id, remote=remote
-                    )
-                await ws.send(json.dumps(reply))
-            elif msg_type == "session_info":
-                pane_id = msg["pane_id"]
-                if pane_id not in known_panes:
-                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
-                    continue
-                remote = pane_remote_map.get(pane_id)
-                info = None
-                agents_snapshot = await asyncio.to_thread(get_all_agents)
-                agent = next(
-                    (a for a in agents_snapshot if a.get("pane_id") == pane_id), None
-                )
-                if agent and agent.get("agent") == "opencode" and agent.get("cwd"):
-                    if remote is None:
-                        info = await asyncio.to_thread(
-                            opencode_session_info, agent["cwd"])
-                    else:
-                        info = await asyncio.to_thread(
-                            opencode_session_info_remote, agent["cwd"], remote)
-                await ws.send(json.dumps(
-                    {"type": "session_info", "pane_id": pane_id, "info": info}))
-            elif msg_type == "last_prompt":
-                pane_id = msg["pane_id"]
-                if pane_id not in known_panes:
-                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
-                    continue
-                remote = pane_remote_map.get(pane_id)
-                prompt = None
-                if remote is None:
-                    agents_snapshot = await asyncio.to_thread(get_all_agents)
-                    agent = next(
-                        (a for a in agents_snapshot if a.get("pane_id") == pane_id), None
-                    )
-                    if agent and agent.get("agent") == "opencode" and agent.get("cwd"):
-                        prompt = await asyncio.to_thread(
-                            opencode_last_user_prompt, agent["cwd"])
-                await ws.send(json.dumps(
-                    {"type": "last_prompt", "pane_id": pane_id, "prompt": prompt}))
-            elif msg_type == "get_history":
-                pane_id = msg["pane_id"]
-                if pane_id not in known_panes:
-                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
-                    continue
-                # History comes from the agent's own transcript, not from the terminal: an agent
-                # TUI runs on the alternate screen, so herdr kept no scrollback for it, and the
-                # one read that does reach older rows costs ~31ms per line and scrolls the
-                # operator's terminal. What used to stand here called `herdr agent history`, a
-                # command that does not exist.
-                #
-                # The session uuid never crosses the wire in either direction: the client sends a
-                # pane_id, the relay looks the ref up in pane_session_map (which it populates from
-                # `pane list`), and transcript.history validates it before it touches a path.
-                try:
-                    limit = int(msg.get("limit", transcript.DEFAULT_LIMIT))
-                except (TypeError, ValueError):
-                    await ws.send(json.dumps({"type": "error", "message": "invalid history limit"}))
-                    continue
-                before = msg.get("before")
-                if before is not None and not isinstance(before, str):
-                    await ws.send(json.dumps({"type": "error", "message": "invalid history cursor"}))
-                    continue
-                remote = pane_remote_map.get(pane_id)
-                pane = agent_cache.get(pane_id) or {}
-                # Off the event loop: a cold read of the biggest transcript on this machine (33MB)
-                # measured 0.29s, and a remote one is an SSH round trip. Neighbouring handlers
-                # block the loop on their subprocess; this one is too slow to join them.
-                body = await asyncio.to_thread(
-                    transcript.history,
-                    pane_session_map.get(pane_id),
-                    remote=remote,
-                    limit=limit,
-                    before=before or None,
-                    include_tools=bool(msg.get("include_tools")),
-                    agent=pane.get("agent", ""),
-                    ssh_args=SSH_BASE_ARGS,
-                    remote_runner=transcript_ssh,
-                    log=log,
-                )
-                await ws.send(json.dumps({"type": "history", "pane_id": pane_id, **body}))
-            elif msg_type == "send_keys":
-                pane_id = msg["pane_id"]
-                request_id = msg.get("request_id")
-
-                def command_error(message):
-                    response = {"type": "error", "message": message}
-                    if request_id:
-                        response["request_id"] = request_id
-                    return response
-
-                if pane_id not in known_panes:
-                    await ws.send(json.dumps(command_error("unknown pane_id")))
-                    continue
-                keys = msg.get("keys", [])
-                if not isinstance(keys, list) or not keys:
-                    log.warning("send_keys from %s (%s) has no key list: %.120r", ip, device, keys)
-                    await ws.send(json.dumps(command_error("keys contain disallowed values")))
-                    continue
-                refused = [key for key in keys if not key_is_allowed(key)]
-                if refused:
-                    # Logged because the refusal is otherwise INVISIBLE: this branch returns above
-                    # the `log.info` below, so a client sending a key this relay does not know
-                    # left no trace at all -- which is exactly the case that needs diagnosing,
-                    # since it is what a client newer than its relay looks like.
-                    log.warning("send_keys from %s (%s) refused for pane %s: %.120r",
-                                ip, device, pane_id, refused)
-                    detail = ", ".join(str(key)[:24] for key in refused[:4])
-                    await ws.send(json.dumps(
-                        command_error(f"keys contain disallowed values: {detail}")))
-                    continue
-                remote = pane_remote_map.get(pane_id)
-                content = await asyncio.to_thread(read_pane, pane_id, remote=remote)
-                if detect_approval_options(content) and any(key.isdigit() for key in keys):
-                    if question_prompt_id(pane_id, content) != msg.get("prompt_id", ""):
-                        await ws.send(json.dumps(command_error("prompt changed; refresh and try again")))
-                        continue
-                log.info("Keys from %s (%s): pane=%s keys=%s", ip, device, pane_id, keys)
-                audit("send_keys", ip, device, pane_id, f"keys={keys}")
-                # Keys herdr's validator refuses (CSI_TILDE_KEYS / CSI_LETTER_KEYS) travel as raw
-                # CSI bytes through `pane send-text`. Consecutive keys of one kind go out in a
-                # single call, and the runs keep the order the client sent them -- a client that
-                # queues [Escape, PageUp, Enter] gets those three in that order, not regrouped.
-                runs = []
-                for key in keys:
-                    sequence = key_escape_sequence(key)
-                    kind = "send-text" if sequence else "send-keys"
-                    if runs and runs[-1][0] == kind:
-                        runs[-1][1].append(sequence or key)
-                    else:
-                        runs.append((kind, [sequence or key]))
-                failure = ""
-                for kind, payload in runs:
-                    # send-text takes ONE text argument, so a run of CSI keys is concatenated.
-                    args = ["".join(payload)] if kind == "send-text" else payload
+                async for raw in ws:
                     try:
-                        result = await asyncio.to_thread(
-                            run_herdr_result, "pane", kind, pane_id, *args, remote=remote
-                        )
-                    except Exception as exc:
-                        failure = f"raised {exc}"
-                    else:
-                        if result.returncode != 0:
-                            failure = f"exit {result.returncode}"
-                    if failure:
-                        log.warning("send_keys %s failed for pane %s: %s", kind, pane_id, failure)
-                        break
-                if failure:
-                    await ws.send(json.dumps(command_error("send_keys command failed")))
-                    continue
-                response = {"type": "command_result", "command": "send_keys", "ok": True}
-                if request_id:
-                    response["request_id"] = request_id
-                await ws.send(json.dumps(response))
-            elif msg_type == "send_text":
-                pane_id = msg["pane_id"]
-                if pane_id not in known_panes:
-                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
-                    continue
-                text = msg.get("text", "")
-                if not text or len(text) > 1000:
-                    await ws.send(json.dumps({"type": "error", "message": "text empty or too long"}))
-                    continue
-                remote = pane_remote_map.get(pane_id)
-                log.info("Text from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
-                audit("send_text", ip, device, pane_id, f"text={text!r}")
-                await asyncio.to_thread(run_herdr, "pane", "send-text", pane_id, text, remote=remote)
-            elif msg_type == "agent_prompt":
-                # Use 'herdr agent prompt' for proper submission (works with Codex, Claude, etc.)
-                request_id = msg.get("request_id")
-                pane_id = msg["pane_id"]
-                if pane_id not in known_panes:
-                    response = {"type": "error", "message": "unknown pane_id"}
-                    if request_id:
-                        response["request_id"] = request_id
-                    await ws.send(json.dumps(response))
-                    continue
-                text = msg.get("text", "")
-                if not text or len(text) > 10000:
-                    response = {"type": "error", "message": "text empty or too long"}
-                    if request_id:
-                        response["request_id"] = request_id
-                    await ws.send(json.dumps(response))
-                    continue
-                remote = pane_remote_map.get(pane_id)
-                log.info("Agent prompt from %s (%s): pane=%s text=%r", ip, device, pane_id, text[:100])
-                audit("agent_prompt", ip, device, pane_id, f"text={text[:100]!r}")
-                await asyncio.to_thread(run_herdr, "agent", "prompt", pane_id, text, remote=remote)
-                response = {"type": "command_result", "command": "agent_prompt", "ok": True}
-                if request_id:
-                    response["request_id"] = request_id
-                await ws.send(json.dumps(response))
-            elif msg_type == "focus":
-                # Move herdr's own focus. Which id the client sent says what to focus, so there is
-                # no separate kind field: `agent focus` takes a pane, and herdr walks up to the
-                # tab and workspace holding it. (A non-agent pane has no such command -- `pane
-                # focus` only steps to a neighbour by direction -- so focusing a shell pane will
-                # mean tab focus plus a walk when those panes are listed at all.)
-                target_kind, ident = "", ""
-                for kind, field in (("pane", "pane_id"), ("tab", "tab_id"), ("workspace", "workspace_id")):
-                    if msg.get(field):
-                        target_kind, ident = kind, msg[field]
-                        break
-                if not target_kind:
-                    await ws.send(json.dumps({"type": "error", "message": "pane_id, tab_id or workspace_id required"}))
-                    continue
-                if target_kind == "pane":
-                    if ident not in known_panes:
-                        await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
                         continue
-                    remote = pane_remote_map.get(ident)
-                    shell = shell_pane_map.get(ident)
-                    if shell is not None:
-                        log.info("Focus from %s (%s): shell pane=%s", ip, device, ident)
-                        audit("focus", ip, device, ident, f"shell pane={ident}")
+                    if not isinstance(msg, dict):
+                        continue
+                    msg_type = msg.get("type")
+                    pane_id = msg.get("pane_id")
+                    if pane_id is not None and not isinstance(pane_id, str):
+                        await ws.send(json.dumps(error_reply(msg, "pane_id must be a string")))
+                        continue
+                    if pane_id in ambiguous_panes:
+                        # Two hosts report this id; every map below would route it to whichever
+                        # was listed last. Refuse rather than type into the wrong machine.
+                        await ws.send(json.dumps(error_reply(
+                            msg, "pane id is reported by more than one host; refusing rather than guessing")))
+                        continue
+                    # One place, ahead of every handler, so a new one cannot forget to clear a pane's unread
+                    # state (see SEEN_ON). Ahead of validation too: a client that named a known pane did
+                    # look at it, whatever the rest of the message turns out to be.
+                    if msg_type in SEEN_ON:
+                        activity_note_seen(msg.get("pane_id", ""))
+                    if msg_type == "question_toggle":
+                        pane_id = msg["pane_id"]
+                        option = msg.get("option", "")
+                        request_id = msg.get("request_id")
+
+                        def question_error(message):
+                            response = {"type": "error", "message": message}
+                            if request_id:
+                                response["request_id"] = request_id
+                            return response
+
+                        if pane_id not in known_panes or not option:
+                            await ws.send(json.dumps(question_error("invalid question option")))
+                            continue
+                        remote = pane_remote_map.get(pane_id)
+                        if not await asyncio.to_thread(
+                            prompt_matches, pane_id, msg.get("prompt_id", ""), remote=remote
+                        ):
+                            await ws.send(json.dumps(question_error("question changed; refresh and try again")))
+                            continue
+                        ok = bool(await asyncio.to_thread(toggle_question_option, pane_id, option, remote=remote))
+                        if not ok:
+                            await ws.send(json.dumps(question_error("question option toggle failed")))
+                        elif request_id:
+                            # The ack a requester waits on; without a request_id (the web
+                            # client) silence on success stays the contract.
+                            await ws.send(json.dumps({
+                                "type": "command_result", "command": "question_toggle",
+                                "ok": True, "request_id": request_id,
+                            }))
+                    elif msg_type == "question_submit":
+                        pane_id = msg["pane_id"]
+                        request_id = msg.get("request_id")
+
+                        def submit_error(message):
+                            response = {"type": "error", "message": message}
+                            if request_id:
+                                response["request_id"] = request_id
+                            return response
+
+                        if pane_id not in known_panes:
+                            await ws.send(json.dumps(submit_error("unknown pane_id")))
+                            continue
+                        remote = pane_remote_map.get(pane_id)
+                        if not await asyncio.to_thread(
+                            prompt_matches, pane_id, msg.get("prompt_id", ""), remote=remote
+                        ):
+                            await ws.send(json.dumps(submit_error("question changed; refresh and try again")))
+                            continue
+                        ok = bool(await asyncio.to_thread(submit_multi_question, pane_id, remote=remote))
+                        if not ok:
+                            await ws.send(json.dumps(submit_error("question submission failed")))
+                        elif request_id:
+                            await ws.send(json.dumps({
+                                "type": "command_result", "command": "question_submit",
+                                "ok": True, "request_id": request_id,
+                            }))
+                    elif msg_type == "respond":
+                        pane_id = msg["pane_id"]
+                        request_id = msg.get("request_id")
+
+                        def command_error(message):
+                            response = {"type": "error", "message": message}
+                            if request_id:
+                                response["request_id"] = request_id
+                            return response
+
+                        if pane_id not in known_panes:
+                            await ws.send(json.dumps(command_error("unknown pane_id")))
+                            continue
+                        text = msg.get("text", "").strip()
+                        if not text or len(text) > 1000:
+                            await ws.send(json.dumps(command_error("response empty or too long")))
+                            continue
+                        remote = pane_remote_map.get(pane_id)
+                        if pane_id in shell_pane_map:
+                            # A shell pane has no question to detect, no approval options to match and no
+                            # harness to refuse a bad answer: the text IS a command and Enter runs it.
+                            # That is what HERDR_SHELL_PANES buys and why it is off by default. The
+                            # question guard below would refuse every one of these, so it is skipped
+                            # rather than tricked -- and the audit line says which kind of pane it was.
+                            log.info("Shell command from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
+                            audit("respond_shell", ip, device, pane_id, f"text={text!r}")
+                            delivered = await asyncio.to_thread(
+                                _mutate_herdr, "pane", "send-text", pane_id, text, remote=remote
+                            ) and await asyncio.to_thread(
+                                _mutate_herdr, "pane", "send-keys", pane_id, "Enter", remote=remote
+                            )
+                            await ws.send(json.dumps(
+                                {"type": "command_result", "command": "respond", "ok": bool(delivered),
+                                 **({"request_id": request_id} if request_id else {})}))
+                            continue
+                        content = await asyncio.to_thread(read_pane, pane_id, remote=remote)
+                        if question_prompt_id(pane_id, content) != msg.get("prompt_id", ""):
+                            await ws.send(json.dumps(command_error("prompt changed; refresh and try again")))
+                            continue
+                        question = (
+                            detect_question(content)
+                            if await asyncio.to_thread(pane_is_omp, pane_id, remote=remote)
+                            else None
+                        )
+                        log.info("Response from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
+                        audit("respond", ip, device, pane_id, f"text={text!r}")
+                        if question:
+                            delivered = await asyncio.to_thread(
+                                respond_to_question, pane_id, text, question, remote=remote
+                            )
+                        elif await asyncio.to_thread(
+                            respond_opencode_dismiss, pane_id, text, content, remote=remote
+                        ):
+                            delivered = True
+                        elif await asyncio.to_thread(
+                            respond_opencode_permission, pane_id, text, content, remote=remote
+                        ):
+                            delivered = True
+                        elif await asyncio.to_thread(
+                            respond_opencode_question, pane_id, text, content, remote=remote
+                        ):
+                            delivered = True
+                        elif await asyncio.to_thread(
+                            respond_opencode_review, pane_id, text, content, remote=remote
+                        ):
+                            delivered = True
+                        elif custom_editor_active(content) or text.lower() in SAFE_RESPONSES:
+                            delivered = await asyncio.to_thread(
+                                _mutate_herdr, "pane", "send-text", pane_id, text, remote=remote
+                            ) and await asyncio.to_thread(
+                                _mutate_herdr, "pane", "send-keys", pane_id, "Enter", remote=remote
+                            )
+                        else:
+                            await ws.send(json.dumps({
+                                **command_error("free-text response requires a detected question"),
+                            }))
+                            continue
+                        if not delivered:
+                            await ws.send(json.dumps(command_error("response delivery failed")))
+                            continue
+                        response = {"type": "command_result", "command": "respond", "ok": True}
+                        if request_id:
+                            response["request_id"] = request_id
+                        await ws.send(json.dumps(response))
+                    elif msg_type == "session_switch":
+                        request_id = msg.get("request_id")
+                        # The allowlist read is one `herdr session list` per call -- an ssh round trip
+                        # for a remote -- so it goes to a worker thread. The mutation stays here: it
+                        # drains an asyncio.Queue and bumps POLL_GENERATION, neither safe off the loop.
+                        names = await asyncio.to_thread(session_switch_names, msg.get("host"))
+                        ok, err, changed = apply_session_switch(
+                            msg.get("host"), msg.get("session"), ip, device, names=names
+                        )
+                        if not ok:
+                            response = {"type": "error", "message": err}
+                            if request_id:
+                                response["request_id"] = request_id
+                            await ws.send(json.dumps(response))
+                        else:
+                            # A no-op switch (already-active selection) still acks,
+                            # but must skip the broadcast and re-poll -- that's the
+                            # expensive part `changed` exists to let us avoid.
+                            if changed:
+                                await broadcast_sessions()
+                            if request_id:
+                                await ws.send(json.dumps({
+                                    "type": "command_result",
+                                    "command": "session_switch",
+                                    "request_id": request_id,
+                                    "ok": True,
+                                }))
+                            if changed:
+                                try:
+                                    await _poll_once()
+                                except Exception:
+                                    log.exception("post-switch poll failed")
+                    elif msg_type == "agent_event":
+                        event_queue.put_nowait(msg)
+                    elif msg_type == "read_pane":
+                        pane_id = msg["pane_id"]
+                        if pane_id not in known_panes:
+                            await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                            continue
+                        read_format = msg.get("format", "text")
+                        if read_format not in {"text", "ansi"}:
+                            await ws.send(json.dumps({"type": "error", "message": "invalid pane read format"}))
+                            continue
+                        # herdr clamps pane.read at ~1000 lines and does not say so (`truncated` stays
+                        # true either way): 999/1000/1500/5000 all came back with the same 1000 rows.
+                        # Asking for more only buys a bigger request, so refuse to pretend.
+                        try:
+                            lines = max(1, min(int(msg.get("lines", 30)), MAX_READ_LINES))
+                        except (TypeError, ValueError):
+                            await ws.send(json.dumps({"type": "error", "message": "invalid pane read lines"}))
+                            continue
+                        # Clients pick the source: `visible` for a live mirror poll (free, viewport only),
+                        # `recent`/`recent-unwrapped` when the user explicitly asks for scrollback. Note
+                        # `recent` + text on an alt-screen agent pane is the multi-second harvest that
+                        # scrolls the operator's terminal (see PROMPT_READ_SOURCE) -- it is allowed here
+                        # because it is user-initiated, not because it is cheap.
+                        read_source = str(msg.get("source", "recent")).replace("_", "-")
+                        if read_source not in READ_SOURCES:
+                            await ws.send(json.dumps({"type": "error", "message": "invalid pane read source"}))
+                            continue
+                        remote = pane_remote_map.get(pane_id)
+                        content = await asyncio.to_thread(
+                            run_herdr,
+                            "pane", "read", pane_id, "--lines", str(lines), "--source", read_source,
+                            "--format", read_format, remote=remote
+                        )
+                        reply = {"type": "pane_content", "pane_id": pane_id, "content": content}
+                        if msg.get("process"):
+                            # One extra CLI call, so it is asked for rather than always sent: a client
+                            # wants it when it OPENS a pane, not on every mirror refresh.
+                            reply["process"] = await asyncio.to_thread(
+                                pane_process, pane_id, remote=remote
+                            )
+                        await ws.send(json.dumps(reply))
+                    elif msg_type == "session_info":
+                        pane_id = msg["pane_id"]
+                        if pane_id not in known_panes:
+                            await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                            continue
+                        remote = pane_remote_map.get(pane_id)
+                        info = None
+                        agents_snapshot = await asyncio.to_thread(get_all_agents)
+                        agent = next(
+                            (a for a in agents_snapshot if a.get("pane_id") == pane_id), None
+                        )
+                        if agent and agent.get("agent") == "opencode" and agent.get("cwd"):
+                            if remote is None:
+                                info = await asyncio.to_thread(
+                                    opencode_session_info, agent["cwd"])
+                            else:
+                                info = await asyncio.to_thread(
+                                    opencode_session_info_remote, agent["cwd"], remote)
+                        await ws.send(json.dumps(
+                            {"type": "session_info", "pane_id": pane_id, "info": info}))
+                    elif msg_type == "last_prompt":
+                        pane_id = msg["pane_id"]
+                        if pane_id not in known_panes:
+                            await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                            continue
+                        remote = pane_remote_map.get(pane_id)
+                        prompt = None
+                        if remote is None:
+                            agents_snapshot = await asyncio.to_thread(get_all_agents)
+                            agent = next(
+                                (a for a in agents_snapshot if a.get("pane_id") == pane_id), None
+                            )
+                            if agent and agent.get("agent") == "opencode" and agent.get("cwd"):
+                                prompt = await asyncio.to_thread(
+                                    opencode_last_user_prompt, agent["cwd"])
+                        await ws.send(json.dumps(
+                            {"type": "last_prompt", "pane_id": pane_id, "prompt": prompt}))
+                    elif msg_type == "get_history":
+                        pane_id = msg["pane_id"]
+                        if pane_id not in known_panes:
+                            await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                            continue
+                        # History comes from the agent's own transcript, not from the terminal: an agent
+                        # TUI runs on the alternate screen, so herdr kept no scrollback for it, and the
+                        # one read that does reach older rows costs ~31ms per line and scrolls the
+                        # operator's terminal. What used to stand here called `herdr agent history`, a
+                        # command that does not exist.
+                        #
+                        # The session uuid never crosses the wire in either direction: the client sends a
+                        # pane_id, the relay looks the ref up in pane_session_map (which it populates from
+                        # `pane list`), and transcript.history validates it before it touches a path.
+                        try:
+                            limit = int(msg.get("limit", transcript.DEFAULT_LIMIT))
+                        except (TypeError, ValueError):
+                            await ws.send(json.dumps({"type": "error", "message": "invalid history limit"}))
+                            continue
+                        before = msg.get("before")
+                        if before is not None and not isinstance(before, str):
+                            await ws.send(json.dumps({"type": "error", "message": "invalid history cursor"}))
+                            continue
+                        remote = pane_remote_map.get(pane_id)
+                        pane = agent_cache.get(pane_id) or {}
+                        # Off the event loop: a cold read of the biggest transcript on this machine (33MB)
+                        # measured 0.29s, and a remote one is an SSH round trip. Neighbouring handlers
+                        # block the loop on their subprocess; this one is too slow to join them.
+                        body = await asyncio.to_thread(
+                            transcript.history,
+                            pane_session_map.get(pane_id),
+                            remote=remote,
+                            limit=limit,
+                            before=before or None,
+                            include_tools=bool(msg.get("include_tools")),
+                            agent=pane.get("agent", ""),
+                            ssh_args=SSH_BASE_ARGS,
+                            remote_runner=transcript_ssh,
+                            log=log,
+                        )
+                        await ws.send(json.dumps({"type": "history", "pane_id": pane_id, **body}))
+                    elif msg_type == "send_keys":
+                        pane_id = msg["pane_id"]
+                        request_id = msg.get("request_id")
+
+                        def command_error(message):
+                            response = {"type": "error", "message": message}
+                            if request_id:
+                                response["request_id"] = request_id
+                            return response
+
+                        if pane_id not in known_panes:
+                            await ws.send(json.dumps(command_error("unknown pane_id")))
+                            continue
+                        keys = msg.get("keys", [])
+                        if not isinstance(keys, list) or not keys:
+                            log.warning("send_keys from %s (%s) has no key list: %.120r", ip, device, keys)
+                            await ws.send(json.dumps(command_error("keys contain disallowed values")))
+                            continue
+                        refused = [key for key in keys if not key_is_allowed(key)]
+                        if refused:
+                            # Logged because the refusal is otherwise INVISIBLE: this branch returns above
+                            # the `log.info` below, so a client sending a key this relay does not know
+                            # left no trace at all -- which is exactly the case that needs diagnosing,
+                            # since it is what a client newer than its relay looks like.
+                            log.warning("send_keys from %s (%s) refused for pane %s: %.120r",
+                                        ip, device, pane_id, refused)
+                            detail = ", ".join(str(key)[:24] for key in refused[:4])
+                            await ws.send(json.dumps(
+                                command_error(f"keys contain disallowed values: {detail}")))
+                            continue
+                        remote = pane_remote_map.get(pane_id)
+                        content = await asyncio.to_thread(read_pane, pane_id, remote=remote)
+                        if detect_approval_options(content) and any(key.isdigit() for key in keys):
+                            if question_prompt_id(pane_id, content) != msg.get("prompt_id", ""):
+                                await ws.send(json.dumps(command_error("prompt changed; refresh and try again")))
+                                continue
+                        log.info("Keys from %s (%s): pane=%s keys=%s", ip, device, pane_id, keys)
+                        audit("send_keys", ip, device, pane_id, f"keys={keys}")
+                        # Keys herdr's validator refuses (CSI_TILDE_KEYS / CSI_LETTER_KEYS) travel as raw
+                        # CSI bytes through `pane send-text`. Consecutive keys of one kind go out in a
+                        # single call, and the runs keep the order the client sent them -- a client that
+                        # queues [Escape, PageUp, Enter] gets those three in that order, not regrouped.
+                        runs = []
+                        for key in keys:
+                            sequence = key_escape_sequence(key)
+                            kind = "send-text" if sequence else "send-keys"
+                            if runs and runs[-1][0] == kind:
+                                runs[-1][1].append(sequence or key)
+                            else:
+                                runs.append((kind, [sequence or key]))
+                        failure = ""
+                        for kind, payload in runs:
+                            # send-text takes ONE text argument, so a run of CSI keys is concatenated.
+                            args = ["".join(payload)] if kind == "send-text" else payload
+                            try:
+                                result = await asyncio.to_thread(
+                                    run_herdr_result, "pane", kind, pane_id, *args, remote=remote
+                                )
+                            except Exception as exc:
+                                failure = f"raised {exc}"
+                            else:
+                                if result.returncode != 0:
+                                    failure = f"exit {result.returncode}"
+                            if failure:
+                                log.warning("send_keys %s failed for pane %s: %s", kind, pane_id, failure)
+                                break
+                        if failure:
+                            await ws.send(json.dumps(command_error("send_keys command failed")))
+                            continue
+                        response = {"type": "command_result", "command": "send_keys", "ok": True}
+                        if request_id:
+                            response["request_id"] = request_id
+                        await ws.send(json.dumps(response))
+                    elif msg_type == "send_text":
+                        pane_id = msg["pane_id"]
+                        if pane_id not in known_panes:
+                            await ws.send(json.dumps(error_reply(msg, "unknown pane_id")))
+                            continue
+                        text = msg.get("text", "")
+                        if not text or len(text) > 1000:
+                            await ws.send(json.dumps(error_reply(msg, "text empty or too long")))
+                            continue
+                        remote = pane_remote_map.get(pane_id)
+                        log.info("Text from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
+                        audit("send_text", ip, device, pane_id, f"text={text!r}")
+                        sent = await asyncio.to_thread(
+                            _mutate_herdr, "pane", "send-text", pane_id, text, remote=remote)
+                        await ws.send(json.dumps(command_reply(msg, "send_text", True) if sent
+                                                 else error_reply(msg, "send_text command failed")))
+                    elif msg_type == "agent_prompt":
+                        # Use 'herdr agent prompt' for proper submission (works with Codex, Claude, etc.)
+                        request_id = msg.get("request_id")
+                        pane_id = msg["pane_id"]
+                        if pane_id not in known_panes:
+                            response = {"type": "error", "message": "unknown pane_id"}
+                            if request_id:
+                                response["request_id"] = request_id
+                            await ws.send(json.dumps(response))
+                            continue
+                        text = msg.get("text", "")
+                        if not text or len(text) > 10000:
+                            response = {"type": "error", "message": "text empty or too long"}
+                            if request_id:
+                                response["request_id"] = request_id
+                            await ws.send(json.dumps(response))
+                            continue
+                        remote = pane_remote_map.get(pane_id)
+                        log.info("Agent prompt from %s (%s): pane=%s text=%r", ip, device, pane_id, text[:100])
+                        audit("agent_prompt", ip, device, pane_id, f"text={text[:100]!r}")
+                        prompted = await asyncio.to_thread(
+                            _mutate_herdr, "agent", "prompt", pane_id, text, remote=remote)
+                        await ws.send(json.dumps(command_reply(msg, "agent_prompt", True) if prompted
+                                                 else error_reply(msg, "agent_prompt command failed")))
+                    elif msg_type == "focus":
+                        # Move herdr's own focus. Which id the client sent says what to focus, so there is
+                        # no separate kind field: `agent focus` takes a pane, and herdr walks up to the
+                        # tab and workspace holding it. (A non-agent pane has no such command -- `pane
+                        # focus` only steps to a neighbour by direction -- so focusing a shell pane will
+                        # mean tab focus plus a walk when those panes are listed at all.)
+                        target_kind, ident = "", ""
+                        for kind, field in (("pane", "pane_id"), ("tab", "tab_id"), ("workspace", "workspace_id")):
+                            if msg.get(field):
+                                target_kind, ident = kind, msg[field]
+                                break
+                        if not target_kind:
+                            await ws.send(json.dumps(error_reply(msg, "pane_id, tab_id or workspace_id required")))
+                            continue
+                        if target_kind == "pane":
+                            if ident not in known_panes:
+                                await ws.send(json.dumps(error_reply(msg, "unknown pane_id")))
+                                continue
+                            remote = pane_remote_map.get(ident)
+                            shell = shell_pane_map.get(ident)
+                            if shell is not None:
+                                log.info("Focus from %s (%s): shell pane=%s", ip, device, ident)
+                                audit("focus", ip, device, ident, f"shell pane={ident}")
+                                moved = await asyncio.to_thread(
+                                    focus_shell_pane, ident, shell.get("tab_id", ""), remote=remote
+                                )
+                                mark_spaces_dirty()
+                                await ws.send(json.dumps(
+                                    command_reply(msg, "focus", moved)))
+                                continue
+                            args = ("agent", "focus", ident)
+                        else:
+                            ok, remote, error = resolve_space(target_kind, ident, msg.get("host", ""))
+                            if not ok:
+                                await ws.send(json.dumps(error_reply(msg, error)))
+                                continue
+                            args = (target_kind, "focus", ident)
+                        log.info("Focus from %s (%s): %s=%s", ip, device, target_kind, ident)
+                        audit("focus", ip, device, ident if target_kind == "pane" else "", f"{target_kind}={ident}")
                         moved = await asyncio.to_thread(
-                            focus_shell_pane, ident, shell.get("tab_id", ""), remote=remote
+                            _mutate_herdr, *args, remote=remote
+                        )
+                        # Focus is the one mutation whose whole effect is in the hierarchy, so the next
+                        # broadcast has to carry it rather than wait out the slow cadence.
+                        mark_spaces_dirty()
+                        await ws.send(json.dumps(command_reply(msg, "focus", moved)))
+                    elif msg_type == "create_tab":
+                        workspace_id = msg.get("workspace_id", "")
+                        ok, remote, error = resolve_space("workspace", workspace_id, msg.get("host", ""))
+                        if not ok:
+                            await ws.send(json.dumps(error_reply(msg, error)))
+                            continue
+                        label = clean_label(msg.get("label", ""))
+                        log.info("Create tab from %s (%s): workspace=%s", ip, device, workspace_id)
+                        audit("create_tab", ip, device, "", f"workspace={workspace_id}")
+                        args = ["tab", "create", "--workspace", workspace_id, "--focus"]
+                        if label:
+                            args += ["--label", label]
+                        created = await asyncio.to_thread(
+                            _mutate_herdr, *args, remote=remote
                         )
                         mark_spaces_dirty()
-                        await ws.send(json.dumps(
-                            {"type": "command_result", "command": "focus", "ok": moved}))
-                        continue
-                    args = ("agent", "focus", ident)
-                else:
-                    ok, remote, error = resolve_space(target_kind, ident, msg.get("host", ""))
-                    if not ok:
-                        await ws.send(json.dumps({"type": "error", "message": error}))
-                        continue
-                    args = (target_kind, "focus", ident)
-                log.info("Focus from %s (%s): %s=%s", ip, device, target_kind, ident)
-                audit("focus", ip, device, ident if target_kind == "pane" else "", f"{target_kind}={ident}")
-                moved = await asyncio.to_thread(
-                    _mutate_herdr, *args, remote=remote
-                )
-                # Focus is the one mutation whose whole effect is in the hierarchy, so the next
-                # broadcast has to carry it rather than wait out the slow cadence.
-                mark_spaces_dirty()
-                await ws.send(json.dumps({"type": "command_result", "command": "focus", "ok": moved}))
-            elif msg_type == "create_tab":
-                workspace_id = msg.get("workspace_id", "")
-                ok, remote, error = resolve_space("workspace", workspace_id, msg.get("host", ""))
-                if not ok:
-                    await ws.send(json.dumps({"type": "error", "message": error}))
-                    continue
-                label = clean_label(msg.get("label", ""))
-                log.info("Create tab from %s (%s): workspace=%s", ip, device, workspace_id)
-                audit("create_tab", ip, device, "", f"workspace={workspace_id}")
-                args = ["tab", "create", "--workspace", workspace_id, "--focus"]
-                if label:
-                    args += ["--label", label]
-                created = await asyncio.to_thread(
-                    _mutate_herdr, *args, remote=remote
-                )
-                mark_spaces_dirty()
-                await ws.send(json.dumps({"type": "tab_created", "ok": created}))
-            elif msg_type == "rename_tab":
-                tab_id = msg.get("tab_id", "")
-                ok, remote, error = resolve_space("tab", tab_id, msg.get("host", ""))
-                if not ok:
-                    await ws.send(json.dumps({"type": "error", "message": error}))
-                    continue
-                label = clean_label(msg.get("label", ""))
-                if not label:
-                    await ws.send(json.dumps({"type": "error", "message": f"label empty, leading dash, or over {MAX_LABEL_LEN} chars"}))
-                    continue
-                log.info("Rename tab from %s (%s): tab=%s label=%r", ip, device, tab_id, label)
-                audit("rename_tab", ip, device, "", f"tab={tab_id} label={label!r}")
-                renamed = await asyncio.to_thread(
-                    _mutate_herdr, "tab", "rename", tab_id, label, remote=remote
-                )
-                mark_spaces_dirty()
-                await ws.send(json.dumps({"type": "command_result", "command": "rename_tab", "ok": renamed}))
-            elif msg_type == "close_tab":
-                # Destructive, and the relay is the wrong place to second-guess it: closing a tab
-                # takes its panes with it. Clients confirm; this logs who asked.
-                tab_id = msg.get("tab_id", "")
-                ok, remote, error = resolve_space("tab", tab_id, msg.get("host", ""))
-                if not ok:
-                    await ws.send(json.dumps({"type": "error", "message": error}))
-                    continue
-                log.info("Close tab from %s (%s): tab=%s", ip, device, tab_id)
-                audit("close_tab", ip, device, "", f"tab={tab_id}")
-                closed = await asyncio.to_thread(
-                    _mutate_herdr, "tab", "close", tab_id, remote=remote
-                )
-                mark_spaces_dirty()
-                await ws.send(json.dumps({"type": "command_result", "command": "close_tab", "ok": closed}))
-            elif msg_type == "rename_agent":
-                # herdr's own label for the pane, which is what `agents` reports as `label` and
-                # what every client shows as the card title. Nothing is typed into the agent.
-                pane_id = msg.get("pane_id", "")
-                if pane_id not in known_panes:
-                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
-                    continue
-                label = clean_label(msg.get("label", ""))
-                clear = bool(msg.get("clear"))
-                if not label and not clear:
-                    await ws.send(json.dumps({"type": "error", "message": f"label empty, leading dash, or over {MAX_LABEL_LEN} chars"}))
-                    continue
-                remote = pane_remote_map.get(pane_id)
-                log.info("Rename agent from %s (%s): pane=%s label=%r", ip, device, pane_id, label)
-                audit("rename_agent", ip, device, pane_id, f"label={label!r}" if label else "clear")
-                args = ("agent", "rename", pane_id, "--clear") if clear else ("agent", "rename", pane_id, label)
-                renamed = await asyncio.to_thread(
-                    _mutate_herdr, *args, remote=remote
-                )
-                await ws.send(json.dumps({"type": "command_result", "command": "rename_agent", "ok": renamed}))
-            elif msg_type == "push_subscribe":
-                sub = msg.get("subscription")
-                if sub and sub not in push_subscriptions:
-                    push_subscriptions.append(sub)
-                    _save_push_subs()
-                    log.info("Push subscription added from %s (%s)", ip, device)
-                await ws.send(json.dumps({"type": "push_subscribed", "ok": True}))
-            elif msg_type == "push_unsubscribe":
-                sub = msg.get("subscription")
-                if sub and sub in push_subscriptions:
-                    push_subscriptions.remove(sub)
-                    _save_push_subs()
-                await ws.send(json.dumps({"type": "push_unsubscribed", "ok": True}))
+                        await ws.send(json.dumps({"type": "tab_created", "ok": bool(created),
+                                                 **({"request_id": msg["request_id"]} if msg.get("request_id") else {})}))
+                    elif msg_type == "rename_tab":
+                        tab_id = msg.get("tab_id", "")
+                        ok, remote, error = resolve_space("tab", tab_id, msg.get("host", ""))
+                        if not ok:
+                            await ws.send(json.dumps(error_reply(msg, error)))
+                            continue
+                        label = clean_label(msg.get("label", ""))
+                        if not label:
+                            await ws.send(json.dumps(error_reply(msg, f"label empty, leading dash, or over {MAX_LABEL_LEN} chars")))
+                            continue
+                        log.info("Rename tab from %s (%s): tab=%s label=%r", ip, device, tab_id, label)
+                        audit("rename_tab", ip, device, "", f"tab={tab_id} label={label!r}")
+                        renamed = await asyncio.to_thread(
+                            _mutate_herdr, "tab", "rename", tab_id, label, remote=remote
+                        )
+                        mark_spaces_dirty()
+                        await ws.send(json.dumps(command_reply(msg, "rename_tab", renamed)))
+                    elif msg_type == "close_tab":
+                        # Destructive, and the relay is the wrong place to second-guess it: closing a tab
+                        # takes its panes with it. Clients confirm; this logs who asked.
+                        tab_id = msg.get("tab_id", "")
+                        ok, remote, error = resolve_space("tab", tab_id, msg.get("host", ""))
+                        if not ok:
+                            await ws.send(json.dumps(error_reply(msg, error)))
+                            continue
+                        log.info("Close tab from %s (%s): tab=%s", ip, device, tab_id)
+                        audit("close_tab", ip, device, "", f"tab={tab_id}")
+                        closed = await asyncio.to_thread(
+                            _mutate_herdr, "tab", "close", tab_id, remote=remote
+                        )
+                        mark_spaces_dirty()
+                        await ws.send(json.dumps(command_reply(msg, "close_tab", closed)))
+                    elif msg_type == "rename_agent":
+                        # herdr's own label for the pane, which is what `agents` reports as `label` and
+                        # what every client shows as the card title. Nothing is typed into the agent.
+                        pane_id = msg.get("pane_id", "")
+                        if pane_id not in known_panes:
+                            await ws.send(json.dumps(error_reply(msg, "unknown pane_id")))
+                            continue
+                        label = clean_label(msg.get("label", ""))
+                        clear = bool(msg.get("clear"))
+                        if not label and not clear:
+                            await ws.send(json.dumps(error_reply(msg, f"label empty, leading dash, or over {MAX_LABEL_LEN} chars")))
+                            continue
+                        remote = pane_remote_map.get(pane_id)
+                        log.info("Rename agent from %s (%s): pane=%s label=%r", ip, device, pane_id, label)
+                        audit("rename_agent", ip, device, pane_id, f"label={label!r}" if label else "clear")
+                        args = ("agent", "rename", pane_id, "--clear") if clear else ("agent", "rename", pane_id, label)
+                        renamed = await asyncio.to_thread(
+                            _mutate_herdr, *args, remote=remote
+                        )
+                        await ws.send(json.dumps(command_reply(msg, "rename_agent", renamed)))
+                    elif msg_type == "push_subscribe":
+                        sub = msg.get("subscription")
+                        if sub and sub not in push_subscriptions:
+                            push_subscriptions.append(sub)
+                            _save_push_subs()
+                            log.info("Push subscription added from %s (%s)", ip, device)
+                        await ws.send(json.dumps({"type": "push_subscribed", "ok": True}))
+                    elif msg_type == "push_unsubscribe":
+                        sub = msg.get("subscription")
+                        if sub and sub in push_subscriptions:
+                            push_subscriptions.remove(sub)
+                            _save_push_subs()
+                        await ws.send(json.dumps({"type": "push_unsubscribed", "ok": True}))
+                break   # the connection closed cleanly
+            except (ConnectionClosedError, ConnectionClosedOK):
+                raise
+            except Exception:
+                # A handler that raised used to end the whole connection -- one malformed message
+                # (no pane_id, say) or one failed CLI call, and the client was dropped mid-session.
+                # Answer that one message instead and keep reading.
+                log.exception("message from %s (%s) failed: %.160r", ip, device, msg)
+                await ws.send(json.dumps(error_reply(msg, "request failed")))
     except (ConnectionClosedError, ConnectionClosedOK):
         pass
     finally:
@@ -3113,9 +3449,11 @@ async def handle_client(ws):
 class UDPPlugin(asyncio.DatagramProtocol):
     def datagram_received(self, data, addr):
         try:
-            event_queue.put_nowait(json.loads(data.decode()))
+            event = json.loads(data.decode())
         except Exception:
-            pass
+            return
+        if isinstance(event, dict):
+            event_queue.put_nowait(event)
 
 
 def start_mdns():
@@ -3159,7 +3497,9 @@ async def main():
             )
         except OSError:
             log.warning("UDP 8376 in use, plugin push disabled")
-        tasks = [asyncio.create_task(poll_loop()), asyncio.create_task(event_push())]
+        background_tasks.update(poll=asyncio.create_task(poll_loop()),
+                                events=asyncio.create_task(event_push()))
+        tasks = list(background_tasks.values())
         server = await serve(handle_client, RELAY_HOST, WS_PORT, process_request=process_request)
         hosts = ["local"] + REMOTES
         log.info("herdr-remote relay on %s:%d (WebSocket + HTTP POST)", RELAY_HOST, WS_PORT)

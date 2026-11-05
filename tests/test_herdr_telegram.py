@@ -86,7 +86,7 @@ class TelegramQuestionTests(unittest.TestCase):
         markup = bot.sent[0]["reply_markup"]
         self.assertEqual(
             [button.text for row in markup.inline_keyboard for button in row],
-            ["👁 Details", "💬 Reply"],
+            ["≡ Details", "✎ Reply"],
         )
         self.assertIn("web terminal or manual terminal controls", bot.sent[0]["text"])
         self.assertEqual(telegram.pending[(1, 42)], "pane-1")
@@ -113,19 +113,19 @@ class TelegramApprovalCardTests(unittest.TestCase):
         sent = bot.sent[0]
         self.assertEqual(sent["parse_mode"], "HTML")
         text = sent["text"]
-        self.assertIn("🔐 <b>Approval</b> · <b>checkwiseweb</b> · work-mac", text)
+        self.assertIn("◆ <b>Approval</b> · <b>checkwiseweb</b> · work-mac", text)
         self.assertIn("<code>~/saas/checkwiseweb</code>", text)
         self.assertIn("🟢 Bash command", text)
         self.assertIn("Target\n<code>npm run build</code>", text)
         self.assertNotIn("Patterns", text)
-        self.assertIn("⏳ Waiting", text)
+        self.assertIn("‖ Waiting", text)
         self.assertNotIn("Use an approval button", text)
         self.assertNotIn("```", text)
 
         rows = sent["reply_markup"].inline_keyboard
-        self.assertEqual([button.text for button in rows[0]], ["✅ Allow once"])
-        self.assertEqual([button.text for button in rows[1]], ["♾ Allow always", "📁 Trust project"])
-        self.assertEqual([button.text for button in rows[2]], ["❌ Reject", "👁 Details", "💬 Reply"])
+        self.assertEqual([button.text for button in rows[0]], ["✓ Allow once"])
+        self.assertEqual([button.text for button in rows[1]], ["∞ Allow always", "⌂ Trust project"])
+        self.assertEqual([button.text for button in rows[2]], ["✕ Reject", "≡ Details", "✎ Reply"])
         self.assertEqual(
             telegram.parse_callback_data(rows[0][0].callback_data)["action"], "approve")
         self.assertEqual(telegram.approval_messages["pane-1"]["project"], "checkwiseweb")

@@ -12,6 +12,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Mess
 
 from agent_state import apply_agent_message
 import approval_rules
+import transcript
 
 logging.basicConfig(level=logging.INFO)
 # httpx logs every request URL at INFO; that URL contains the bot token. Silence it.
@@ -43,6 +44,8 @@ if not TOKEN:
 
 # State
 pending: OrderedDict[tuple[int, int], str] = OrderedDict()  # (chat_id, message_id) -> pane_id
+# callback token -> (pane_id, `before` turn uuid or None): a turn uuid does not fit in 64 bytes of callback_data
+history_cursors: OrderedDict[str, tuple[str, str | None]] = OrderedDict()
 approval_tokens: dict[str, str] = {}  # pane_id -> current blocked-notification generation
 blocked_prompt_ids: dict[str, str] = {}  # pane_id -> current relay prompt identity
 # pane_id -> the live approval message we must edit (not re-notify) when it closes
@@ -102,6 +105,9 @@ def _web_base() -> str:
 # pane_id -> the live session card: created on start, edited in place while
 # working, edited into the finished card at the end. One message per session.
 working_cards: dict[str, dict] = {}
+# pane_id -> the live multi-select question card: every toggle edits it in place
+# (the relay re-broadcasts the new selection as an update), Submit closes it.
+multi_cards: dict[str, dict] = {}
 agents: list[dict] = []       # current agent list from relay
 prev_statuses: dict[str, str] = {}  # pane_id -> last known status
 relay_connected = False
@@ -168,6 +174,9 @@ ACTION_CODES = {
     "reply": "e",
     "save_rule": "v",
     "retry": "z",
+    "q_toggle": "m",
+    "q_submit": "u",
+    "history": "h",
 }
 CODE_ACTIONS = {code: action for action, code in ACTION_CODES.items()}
 
@@ -229,6 +238,50 @@ async def send_keys_to_relay(pane_id: str, keys: list[str], prompt_id: str | Non
             message["prompt_id"] = prompt_id
         await ws.send(json.dumps(message))
         await await_command_result(ws, request_id, "send_keys")
+
+
+async def question_action(pane_id: str, kind: str, option: str = "",
+                          prompt_id: str | None = None) -> str | None:
+    """Fire a question_toggle / question_submit at the relay and wait for its ack.
+
+    The relay acks request_id'd question commands with a command_result (and
+    errors carry the request_id too). Broadcasts tagged for other clients pass
+    through this socket unheard. Returns the error text, or None on success /
+    ack-timeout — the optimistic card state is authoritative until the relay's
+    next poll corrects it either way.
+    """
+    import websockets
+    async with websockets.connect(RELAY_WS) as ws:
+        request_id = secrets.token_hex(8)
+        message = {
+            "type": kind,
+            "pane_id": pane_id,
+            "prompt_id": prompt_id if prompt_id is not None else blocked_prompt_ids.get(pane_id, ""),
+            "request_id": request_id,
+        }
+        if option:
+            message["option"] = option
+        await ws.send(json.dumps(message))
+        loop = asyncio.get_running_loop()
+        # Keys land in ~100ms locally; 5s covers a remote pane over ssh.
+        deadline = loop.time() + 5
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return None
+            except Exception:
+                return None  # socket dropped after the send; treat as delivered
+            reply = json.loads(raw)
+            if reply.get("request_id") != request_id:
+                continue
+            if reply.get("type") == "error":
+                return reply.get("message", kind)
+            if reply.get("type") == "command_result":
+                return None if reply.get("ok") else reply.get("message", kind)
 
 
 async def read_pane(pane_id: str, lines: int = 100) -> str:
@@ -359,6 +412,33 @@ async def fetch_sessions() -> list[dict] | None:
         return None
 
 
+async def fetch_history(pane_id: str, before: str | None = None) -> dict | None:
+    """One page of the pane's transcript from the relay (`get_history`), oldest turn first."""
+    import websockets
+    request = {"type": "get_history", "pane_id": pane_id, "limit": HISTORY_FETCH, "include_tools": True}
+    if before:
+        request["before"] = before
+    try:
+        async with websockets.connect(RELAY_WS) as ws:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + PANE_READ_TIMEOUT
+            await ws.send(json.dumps(request))
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return None
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                msg = json.loads(raw)
+                if msg.get("type") == "history" and msg.get("pane_id") == pane_id:
+                    return msg
+                if msg.get("type") == "error":
+                    log.warning("History refused: %s", scrub(msg.get("message", "")))
+                    return None
+    except Exception as e:
+        log.warning("Failed to read history: %s", scrub(e))
+        return None
+
+
 async def switch_session(host: str, session: str):
     """Point one host at a named session; raises on relay rejection."""
     import websockets
@@ -421,12 +501,13 @@ def clear_relay_connection_state():
     blocked_prompt_ids.clear()
     approval_messages.clear()
     working_cards.clear()
+    multi_cards.clear()
 
 
 async def send_reply_prompt(message, chat, agent: dict, content: str | None = None):
     if content is None:
         target = agent.get("project") or agent.get("agent") or "the agent"
-        parts = [f"💬 Reply to this message to answer {target}."]
+        parts = [f"✎ Reply to this message to answer {target}."]
     else:
         parts = [pane_content_message(agent, content, limit=3000), "",
                  "Reply to this message to send your response."]
@@ -441,7 +522,7 @@ async def send_reply_prompt(message, chat, agent: dict, content: str | None = No
     return sent
 
 
-STATUS_EMOJI = {"blocked": "🛑", "working": "⚙️", "done": "✅", "idle": "💬", "unknown": "💬"}
+STATUS_EMOJI = {"blocked": "◆", "working": "◐", "done": "✓", "idle": "○", "unknown": "○"}
 
 
 def pane_content_message(agent: dict, content: str, limit: int = 3500) -> str:
@@ -455,11 +536,219 @@ def pane_content_message(agent: dict, content: str, limit: int = 3500) -> str:
     if len(content) > limit:
         content = content[-limit:]
     header = (
-        f"{STATUS_EMOJI.get(status, '💬')} <b>{html.escape(project)}</b>"
+        f"{STATUS_EMOJI.get(status, '○')} <b>{html.escape(project)}</b>"
         f" · {html.escape(agent.get('agent', ''))} · <i>{STATUS_LABELS.get(status, 'IDLE')}</i>"
     )
-    body = html.escape(content) if content else "<i>(no output yet)</i>"
+    body = folded_output(content) if content else "<i>(no output yet)</i>"
     return f"{header}\n\n{body}"
+
+
+FOLD_TAIL_LINES = 12
+
+
+def folded_output(text: str, tail_lines: int = FOLD_TAIL_LINES) -> str:
+    """Terminal text as HTML: the last lines in a <pre>, everything above them folded away.
+
+    <pre> keeps the columns and box drawing a proportional font scrambles; the expandable
+    quote keeps a long read from filling the chat. The quote holds escaped text only --
+    Telegram lets no code entity sit inside a blockquote.
+    """
+    if not text.strip():
+        return ""
+    lines = text.splitlines()
+    head, tail = lines[:-tail_lines], lines[-tail_lines:]
+    pre = f"<pre>{html.escape(chr(10).join(tail))}</pre>"
+    if not "".join(head).strip():
+        return pre
+    return f"<blockquote expandable>{html.escape(chr(10).join(head))}</blockquote>\n{pre}"
+
+
+HISTORY_FETCH = 20
+HISTORY_BUDGET = 3800       # Telegram caps a message at 4096 characters
+HISTORY_TURN_CHARS = 1200
+HISTORY_DIFF_LINES = 12
+HISTORY_UNAVAILABLE = {
+    "no-session": "This pane names no agent transcript.",
+    "no-log": "The transcript file was not found.",
+    "unsupported": "History is not supported for this agent.",
+    "disabled": "History is disabled on the relay.",
+    "error": "The relay could not read the transcript.",
+}
+INLINE_MD_RE = re.compile(r"`([^`\n]+)`|\*\*([^*\n]+)\*\*")
+HEADING_RE = re.compile(r"^\s*#{1,6}\s+(.*)$")
+FENCE_LANG_RE = re.compile(r"^[\w+-]{1,20}$")
+
+
+def md_inline(text: str) -> str:
+    """Escape one line, turning `code` and **bold** into tags. Neither may hold the other."""
+    out, pos = [], 0
+    for match in INLINE_MD_RE.finditer(text):
+        out.append(html.escape(text[pos:match.start()]))
+        if match.group(1) is not None:
+            out.append(f"<code>{html.escape(match.group(1))}</code>")
+        else:
+            out.append(f"<b>{html.escape(match.group(2))}</b>")
+        pos = match.end()
+    out.append(html.escape(text[pos:]))
+    return "".join(out)
+
+
+def pre_block(body: str, lang: str = "") -> str:
+    if not body.strip():
+        return ""
+    if FENCE_LANG_RE.match(lang):
+        return f'<pre><code class="language-{lang}">{html.escape(body)}</code></pre>'
+    return f"<pre>{html.escape(body)}</pre>"
+
+
+def md_html(text: str) -> str:
+    """Agent markdown as Telegram HTML: fenced code, inline code, bold, headings; the rest escaped."""
+    out, code, lang = [], None, ""
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if code is not None:
+            if stripped.startswith("```"):
+                out.append(pre_block("\n".join(code), lang))
+                code = None
+            else:
+                code.append(line)
+            continue
+        if stripped.startswith("```"):
+            code, lang = [], stripped[3:].strip()
+            continue
+        heading = HEADING_RE.match(line)
+        if heading:
+            # Bold may not contain code, so a heading drops its inline marks.
+            out.append(f"<b>{html.escape(heading.group(1).replace('**', '').replace('`', ''))}</b>")
+        else:
+            out.append(md_inline(line))
+    if code is not None:  # a fence the clip cut open
+        out.append(pre_block("\n".join(code), lang))
+    return "\n".join(out).strip()
+
+
+def turn_stamp(ts: str) -> str:
+    """HH:MM in this host's zone -- transcripts are written in UTC -- with the date when not today."""
+    from datetime import datetime
+    try:
+        moment = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+    except (TypeError, ValueError):
+        return ""
+    if moment.date() == datetime.now().astimezone().date():
+        return moment.strftime("%H:%M")
+    return moment.strftime("%b %d %H:%M")
+
+
+def history_turn_html(turn: dict, agent_name: str) -> str:
+    role = turn.get("role")
+    text = turn.get("text") or ""
+    if len(text) > HISTORY_TURN_CHARS:
+        text = text[:HISTORY_TURN_CHARS] + "…"
+    if role == "tool":
+        line = f"▸ <b>{html.escape(turn.get('tool') or 'tool')}</b>"
+        if turn.get("target"):
+            line += f" <code>{html.escape(turn['target'][:200])}</code>"
+        if turn.get("error"):
+            line += f"\n✕ {html.escape((turn.get('result') or 'error')[:200])}"
+        diff = turn.get("diff")
+        if diff:
+            diff_lines = diff.split("\n")
+            line += "\n" + pre_block("\n".join(diff_lines[:HISTORY_DIFF_LINES]), "diff")
+            clipped = len(diff_lines) > HISTORY_DIFF_LINES or turn.get("diff_clipped")
+            line += (f"<i>+{turn.get('added', 0)} −{turn.get('removed', 0)}"
+                     f"{' · first lines only' if clipped else ''}</i>")
+        return line
+    if not text.strip():
+        return ""
+    stamp = turn_stamp(turn.get("ts") or "")
+    stamp = f" · {stamp}" if stamp else ""
+    if role == "user":
+        quote = "blockquote expandable" if len(text) > 300 else "blockquote"
+        return f"<b>You</b>{stamp}\n<{quote}>{html.escape(text)}</blockquote>"
+    if role == "note":
+        return f"<i>{html.escape(text)}</i>"
+    return f"<b>{html.escape(agent_name or 'agent')}</b>{stamp}\n{md_html(text)}"
+
+
+def history_text(agent: dict, body: dict) -> tuple[str, str | None]:
+    """(HTML message, `before` cursor for the next older page or None).
+
+    Fills the message newest turn first until the budget is spent, then shows them in
+    reading order; the cursor is the oldest turn shown, so nothing is skipped between pages.
+    """
+    project = agent.get("project") or agent.get("agent") or "agent"
+    title = body.get("title") or ""
+    header = f"◷ <b>{html.escape(project)}</b>" + (f" · {html.escape(title[:80])}" if title else "")
+    reason = body.get("unavailable")
+    if reason:
+        return f"{header}\n\n<i>{html.escape(HISTORY_UNAVAILABLE.get(reason, reason))}</i>", None
+    messages = body.get("messages") or []
+    blocks, used, oldest, cut = [], len(header), None, False
+    for turn in reversed(messages):
+        rendered = history_turn_html(turn, body.get("agent") or agent.get("agent", ""))
+        if rendered and blocks and used + len(rendered) + 2 > HISTORY_BUDGET:
+            cut = True
+            break
+        if rendered:
+            blocks.append(rendered)
+            used += len(rendered) + 2
+        oldest = turn.get("uuid") or oldest
+    if not blocks:
+        return f"{header}\n\n<i>No conversation yet.</i>", None
+    older = cut or bool(body.get("has_more"))
+    text = "\n\n".join([header, *reversed(blocks)])
+    if not older and body.get("file_truncated"):
+        text += "\n\n<i>Only the end of the transcript was read; it starts earlier.</i>"
+    return text, (oldest if older else None)
+
+
+def history_callback(pane_id: str, before: str | None) -> str:
+    token = secrets.token_hex(4)
+    history_cursors[token] = (pane_id, before)
+    while len(history_cursors) > PENDING_LIMIT:
+        history_cursors.popitem(last=False)
+    return json.dumps({"a": ACTION_CODES["history"], "c": token}, separators=(",", ":"))
+
+
+def history_button(pane_id: str) -> list[InlineKeyboardButton]:
+    """A ◷ History button, only where the relay can read a transcript: the pane names a
+    session and its harness has a reader. Anywhere else it could only say "unavailable"."""
+    agent = find_agent(pane_id)
+    if not agent or not agent.get("has_session") or agent.get("agent") not in transcript.HARNESSES:
+        return []
+    return [InlineKeyboardButton("◷ History", callback_data=pane_callback_data("history", pane_id))]
+
+
+def details_keyboard(pane_id: str) -> InlineKeyboardMarkup | None:
+    button = history_button(pane_id)
+    return InlineKeyboardMarkup([button]) if button else None
+
+
+def history_keyboard(pane_id: str, older: str | None, paged: bool) -> InlineKeyboardMarkup | None:
+    row = []
+    if older:
+        row.append(InlineKeyboardButton("↑ Older", callback_data=history_callback(pane_id, older)))
+    if paged:
+        row.append(InlineKeyboardButton("↓ Latest", callback_data=history_callback(pane_id, None)))
+    return InlineKeyboardMarkup([row]) if row else None
+
+
+async def send_history(message, chat, agent: dict, before: str | None = None, edit: bool = False):
+    """Post one history page, or turn the page in place when `edit` (the Older/Latest buttons)."""
+    body = await fetch_history(agent["pane_id"], before)
+    if body is None:
+        text, older = "Could not read history from the relay.", None
+    else:
+        text, older = history_text(agent, body)
+    markup = history_keyboard(agent["pane_id"], older, paged=before is not None)
+    if edit:
+        try:
+            await message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        except Exception as e:
+            log.warning("Failed to turn history page: %s", scrub(e))
+        return
+    sent = await message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+    register_pending(chat.id, sent.message_id, agent["pane_id"])
 
 
 def agents_for_action(action: str) -> list[dict]:
@@ -757,14 +1046,14 @@ async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             host = source.get("host", "?")
             active = source.get("active")
             entries = ", ".join(
-                f"▶ {entry['name']}" if entry["name"] == active
+                f"● {entry['name']}" if entry["name"] == active
                 else entry["name"] + ("" if entry.get("running") else " (stopped)")
                 for entry in source.get("sessions", [])
             ) or "none"
             suffix = "" if active else " (herdr default)"
             lines.append(f"<b>{html.escape(host)}</b>: {html.escape(entries)}{suffix}")
         await update.message.reply_text(
-            "Sessions (▶ active):\n" + "\n".join(lines)
+            "Sessions (● active):\n" + "\n".join(lines)
             + "\n\nSwitch: /session <name>, or /session <host> <name> for a remote.",
             parse_mode="HTML",
         )
@@ -798,8 +1087,28 @@ async def cmd_read(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     content = await read_pane(match["pane_id"])
-    msg = await update.message.reply_text(pane_content_message(match, content), parse_mode="HTML")
+    msg = await update.message.reply_text(pane_content_message(match, content), parse_mode="HTML",
+                                          reply_markup=details_keyboard(match["pane_id"]))
     register_pending(update.effective_chat.id, msg.message_id, match["pane_id"])
+
+
+async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /history [project] — the agent's conversation, read from its transcript."""
+    args = ctx.args
+    if not args:
+        if not agents:
+            await update.message.reply_text("No agents. Use /agents to check.")
+            return
+        await update.message.reply_text("History of which agent?", reply_markup=build_agent_keyboard("history"))
+        return
+
+    query = " ".join(args).lower()
+    match = next((a for a in agents if query in a.get("project", "").lower() or query in a.get("agent", "").lower()), None)
+    if not match:
+        await update.message.reply_text(f"No agent matching '{query}'. Use /agents to see list.")
+        return
+
+    await send_history(update.message, update.effective_chat, match)
 
 
 async def cmd_interrupt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1024,9 +1333,28 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         approval_rules.add_command_rule(offer["project"], offer["subject"])
         try:
             await query.edit_message_text(
-                offer.get("text", "♾") + "\n\n♾ Rule saved", parse_mode="HTML")
+                offer.get("text", "∞") + "\n\n∞ Rule saved", parse_mode="HTML")
         except Exception:
             pass
+        return
+
+    if action == "history":
+        # From the agent picker the pane rides in "p"; Older/Latest carry a cursor token
+        # instead and turn the page in place.
+        before = None
+        if data.get("c"):
+            cursor = history_cursors.get(data["c"])
+            if cursor is None:
+                await query.message.reply_text("That page has expired. Use /history again.")
+                return
+            pane_id, before = cursor
+        else:
+            pane_id = data.get("pane_id")
+        agent = find_agent(pane_id) if pane_id else None
+        if agent is None:
+            await query.message.reply_text("That agent is no longer available. Use /history again.")
+            return
+        await send_history(query.message, update.effective_chat, agent, before, edit=bool(data.get("c")))
         return
 
     selected_agent = None
@@ -1055,7 +1383,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # Answered elsewhere, or a newer prompt owns this pane: close the old
             # card in place instead of sending yet another notification.
             if live and query.message and query.message.message_id == live.get("message_id"):
-                await edit_approval_message(ctx.bot, pane_id, "⌛ Closed")
+                await edit_approval_message(ctx.bot, pane_id, "■ Closed")
             else:
                 await query.message.reply_text(
                     "That approval belongs to an older prompt. Use the latest blocked notification."
@@ -1074,7 +1402,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     text=approval_text(live["project"], live["host"], live["cwd"],
                                        live.get("branch", ""), live["summary"],
                                        live["detail"],
-                                       "⚠️ Destructive — press again to confirm"),
+                                       "△ Destructive — press again to confirm"),
                     parse_mode="HTML",
                     reply_markup=approval_keyboard(pane_id, approval_tokens[pane_id]),
                 )
@@ -1084,14 +1412,14 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if action == "always" and live:
             approval_rules.add_command_rule(
                 live.get("project", ""), approval_subject(live.get("summary", ""), live.get("detail")))
-            outcome = "♾ Allowed · rule saved for this"
+            outcome = "∞ Allowed · rule saved for this"
         elif action == "trust_project" and live:
             approval_rules.add_project_rule(live.get("project", ""))
-            outcome = "📁 Trusted project · allowed"
+            outcome = "⌂ Trusted project · allowed"
         elif action == "reject":
-            outcome = "❌ Rejected"
+            outcome = "✕ Rejected"
         else:
-            outcome = "✅ Allowed · once"
+            outcome = "✓ Allowed · once"
         try:
             await send_to_relay(pane_id, "Reject" if action == "reject" else "Allow once",
                                 prompt_id=blocked_prompt_ids.get(pane_id))
@@ -1110,7 +1438,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     rule_offers[pane_id] = {"project": live["project"], "subject": subject}
                     save_button = InlineKeyboardMarkup([[
                         InlineKeyboardButton(
-                            "💾 Allow always for this",
+                            "∞ Allow always for this",
                             callback_data=pane_callback_data("save_rule", pane_id),
                         )
                     ]])
@@ -1120,9 +1448,65 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if action == "read":
         content = await read_pane(data["pane_id"])
         msg = await query.message.reply_text(
-            pane_content_message(selected_agent, content), parse_mode="HTML"
+            pane_content_message(selected_agent, content), parse_mode="HTML",
+            reply_markup=details_keyboard(data["pane_id"]),
         )
         register_pending(update.effective_chat.id, msg.message_id, data["pane_id"])
+        return
+
+    if action in ("q_toggle", "q_submit"):
+        pane_id = data.get("pane_id") or ""
+        card = multi_cards.get(pane_id)
+        if not card:
+            await query.message.reply_text("That question has already been answered.")
+            return
+
+        async def render_card(submitted: bool = False):
+            """Edit the live card to the card's current state."""
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=card["chat_id"], message_id=card["message_id"],
+                    text=multi_question_text(
+                        card["project"], card.get("question", ""),
+                        card["options"], card.get("details"), card["selected"],
+                        host=card.get("host", ""), submitted=submitted),
+                    parse_mode="HTML",
+                    reply_markup=multi_question_keyboard(
+                        pane_id, card["options"], card["selected"]),
+                )
+                return True
+            except Exception:
+                return False
+
+        if action == "q_toggle":
+            try:
+                index = int(data.get("i", -1))
+                option = card["options"][index]
+            except (ValueError, IndexError):
+                await query.message.reply_text("That option no longer exists.")
+                return
+            # Optimistic: flip the visible state NOW, then drive the pane. The
+            # relay's next poll re-renders the authoritative selection onto the
+            # same message; on failure the flip is taken back.
+            selected = card["selected"]
+            card["selected"] = (
+                [s for s in selected if s != option] if option in selected
+                else [*selected, option]
+            )
+            await render_card()
+            error = await question_action(pane_id, "question_toggle", option=option)
+            if error:
+                card["selected"] = selected  # take the flip back
+                await render_card()
+                await query.message.reply_text(f"Failed: {scrub(error)}")
+                return
+            return
+        error = await question_action(pane_id, "question_submit")
+        if error:
+            await query.message.reply_text(f"Failed: {scrub(error)}")
+            return
+        card["submitted"] = True
+        await render_card(submitted=True)
         return
 
     if action == "interrupt":
@@ -1162,7 +1546,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         await query.message.reply_text(
-            f"🔁 Resubmitted the last prompt to {selected_agent['project']}.")
+            f"↻ Resubmitted the last prompt to {selected_agent['project']}.")
         return
 
     if action == "trust":
@@ -1334,8 +1718,9 @@ def make_keyboard(
             for i, (label, _resp) in enumerate(buttons)
         ]
         keyboard.append([InlineKeyboardButton(
-            "👁 Details", callback_data=pane_callback_data("read", pane_id)),
-            InlineKeyboardButton("💬 Reply", callback_data=pane_callback_data("reply", pane_id)),
+            "≡ Details", callback_data=pane_callback_data("read", pane_id)),
+            InlineKeyboardButton("✎ Reply", callback_data=pane_callback_data("reply", pane_id)),
+            *history_button(pane_id),
         ])
         return InlineKeyboardMarkup(keyboard)
 
@@ -1346,16 +1731,18 @@ def make_keyboard(
         for i, (label, _resp) in enumerate(buttons)
     ]
     keyboard.append([InlineKeyboardButton(
-        "👁 Details", callback_data=pane_callback_data("read", pane_id)),
-        InlineKeyboardButton("💬 Reply", callback_data=pane_callback_data("reply", pane_id)),
+        "≡ Details", callback_data=pane_callback_data("read", pane_id)),
+        InlineKeyboardButton("✎ Reply", callback_data=pane_callback_data("reply", pane_id)),
+        *history_button(pane_id),
     ])
     return InlineKeyboardMarkup(keyboard)
 
 
 def interaction_keyboard(pane_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("👁 Details", callback_data=pane_callback_data("read", pane_id)),
-        InlineKeyboardButton("💬 Reply", callback_data=pane_callback_data("reply", pane_id)),
+        InlineKeyboardButton("≡ Details", callback_data=pane_callback_data("read", pane_id)),
+        InlineKeyboardButton("✎ Reply", callback_data=pane_callback_data("reply", pane_id)),
+        *history_button(pane_id),
     ]])
 
 
@@ -1435,7 +1822,7 @@ def approval_text(project: str, host: str, cwd: str, branch: str, summary: str,
     target/patterns, status. Everything else lives behind Details."""
     mark = approval_rules.severity(approval_subject(summary, detail))
     title, target, patterns = parse_permission(summary, detail)
-    header = f"🔐 <b>Approval</b> · <b>{html.escape(project)}</b>"
+    header = f"◆ <b>Approval</b> · <b>{html.escape(project)}</b>"
     if host and host != "local":
         header += f" · {html.escape(host)}"
     lines = [header]
@@ -1456,16 +1843,16 @@ def approval_keyboard(pane_id: str, generation: str) -> InlineKeyboardMarkup:
     # Allow once is full-width: the default action must not be mistakable for
     # anything with lasting consequences.
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Allow once", callback_data=pane_callback_data(
+        [InlineKeyboardButton("✓ Allow once", callback_data=pane_callback_data(
             "approve", pane_id, g=generation))],
-        [InlineKeyboardButton("♾ Allow always", callback_data=pane_callback_data(
+        [InlineKeyboardButton("∞ Allow always", callback_data=pane_callback_data(
             "always", pane_id, g=generation)),
-         InlineKeyboardButton("📁 Trust project", callback_data=pane_callback_data(
+         InlineKeyboardButton("⌂ Trust project", callback_data=pane_callback_data(
              "trust_project", pane_id, g=generation))],
-        [InlineKeyboardButton("❌ Reject", callback_data=pane_callback_data(
+        [InlineKeyboardButton("✕ Reject", callback_data=pane_callback_data(
             "reject", pane_id, g=generation)),
-         InlineKeyboardButton("👁 Details", callback_data=pane_callback_data("read", pane_id)),
-         InlineKeyboardButton("💬 Reply", callback_data=pane_callback_data("reply", pane_id))],
+         InlineKeyboardButton("≡ Details", callback_data=pane_callback_data("read", pane_id)),
+         InlineKeyboardButton("✎ Reply", callback_data=pane_callback_data("reply", pane_id))],
     ])
 
 
@@ -1473,8 +1860,8 @@ def rules_text() -> str:
     rules = approval_rules.load()
     if not rules:
         return ("No approval rules yet.\n\n"
-                "Press ♾ Allow always on an approval card, or allow the same thing "
-                f"{RULE_OFFER_AFTER}× and a 💾 save-rule button appears.")
+                "Press ∞ Allow always on an approval card, or allow the same thing "
+                f"{RULE_OFFER_AFTER}× and an ∞ Allow always for this button appears.")
     lines = [f"Approval rules ({len(rules)})", ""]
     for i, rule in enumerate(rules, 1):
         subject = rule.get("subject")
@@ -1491,7 +1878,7 @@ def rules_keyboard() -> InlineKeyboardMarkup:
     row, rows = [], []
     for i in range(len(rules)):
         row.append(InlineKeyboardButton(
-            f"🗑 {i + 1}",
+            f"✕ {i + 1}",
             callback_data=json.dumps({"action": "rule_del", "i": i}, separators=(",", ":")),
         ))
         if len(row) == 4:
@@ -1552,25 +1939,25 @@ def completion_summary(content: str):
 def finished_keyboard(pane_id: str, failed: bool) -> InlineKeyboardMarkup:
     rows = []
     if failed:
-        rows.append([InlineKeyboardButton("🔁 Retry", callback_data=pane_callback_data(
+        rows.append([InlineKeyboardButton("↻ Retry", callback_data=pane_callback_data(
             "retry", pane_id))])
-    last = [InlineKeyboardButton("👁 Details", callback_data=pane_callback_data("read", pane_id)),
-            InlineKeyboardButton("💬 Reply", callback_data=pane_callback_data("reply", pane_id))]
+    last = [InlineKeyboardButton("≡ Details", callback_data=pane_callback_data("read", pane_id)),
+            InlineKeyboardButton("✎ Reply", callback_data=pane_callback_data("reply", pane_id))]
     base = _web_base()
     if base:
-        last.append(InlineKeyboardButton("🌐 Web", url=f"{base}/?pane={pane_id}"))
+        last.append(InlineKeyboardButton("↗\ufe0e Web", url=f"{base}/?pane={pane_id}"))
     rows.append(last)
     return InlineKeyboardMarkup(rows)
 
 
 def working_keyboard(pane_id: str) -> InlineKeyboardMarkup:
     rows = [[
-        InlineKeyboardButton("⛔ Interrupt", callback_data=pane_callback_data("interrupt", pane_id)),
-        InlineKeyboardButton("👁 Details", callback_data=pane_callback_data("read", pane_id)),
+        InlineKeyboardButton("■ Interrupt", callback_data=pane_callback_data("interrupt", pane_id)),
+        InlineKeyboardButton("≡ Details", callback_data=pane_callback_data("read", pane_id)),
     ]]
     base = _web_base()
     if base:
-        rows[0].append(InlineKeyboardButton("🌐 Web", url=f"{base}/?pane={pane_id}"))
+        rows[0].append(InlineKeyboardButton("↗\ufe0e Web", url=f"{base}/?pane={pane_id}"))
     return InlineKeyboardMarkup(rows)
 
 
@@ -1582,10 +1969,10 @@ def working_text(agent_data: dict, elapsed, title: str, state: str = "working",
     host = agent_data.get("host", "local")
     cwd = agent_data.get("cwd", "")
     mark, verb = {
-        "working": ("⚙️", "working"),
-        "paused": ("⏸", "waiting for approval"),
-        "ended": ("⏹", "session ended"),
-        "stuck": ("🐌", "possibly stuck"),
+        "working": ("◐", "working"),
+        "paused": ("‖", "waiting for approval"),
+        "ended": ("■", "session ended"),
+        "stuck": ("△", "possibly stuck"),
     }[state]
     header = f"{mark} <b>{project}</b> · {verb}"
     if state != "ended":
@@ -1608,7 +1995,7 @@ def finished_text(agent_data: dict, duration, lines: list[str], hidden: int,
     project = agent_data.get("project") or agent_data.get("agent") or "agent"
     host = agent_data.get("host", "local")
     cwd = agent_data.get("cwd", "")
-    mark, verb = ("❌", "failed") if failed else ("✅", "finished")
+    mark, verb = ("✕", "failed") if failed else ("✓", "finished")
     header = f"{mark} <b>{html.escape(project)}</b> {verb} · {fmt_duration(duration)}"
     if host and host != "local":
         header += f" · {html.escape(host)}"
@@ -1626,6 +2013,59 @@ def finished_text(agent_data: dict, duration, lines: list[str], hidden: int,
     return "\n".join(out)
 
 
+def multi_question_text(project: str, question: str, options: list[str],
+                        details: list[str] | None, selected: list[str],
+                        host: str = "", submitted: bool = False) -> str:
+    """The multi-select card, rendered ONLY from structured data -- the raw
+    terminal tail never appears, so no numbered rows, paths or internal
+    echoes leak in, and nothing is duplicated with the buttons."""
+    header = f"◆ <b>{html.escape(project)}</b> · choose one or more"
+    if host and host != "local":
+        header += f" · {html.escape(host)}"
+    out = [header]
+    if question:
+        # One line of context if pi's header row survived next to the question.
+        out += ["", html.escape(question)]
+    details = details or []
+    if options:
+        out += [""]
+        for index, option in enumerate(options):
+            mark = "▣" if option in selected else "□"
+            out.append(f"{mark} <b>{html.escape(option)}</b>")
+            detail = details[index] if index < len(details) else ""
+            if detail:
+                out.append(f"　<i>{html.escape(detail)}</i>")
+    count = len(selected)
+    if submitted:
+        out += ["", f"<i>‖ Submitted — {count} selected, waiting for the agent.</i>"]
+    else:
+        out += ["", f"<i>{count} selected · tap options to toggle</i>"]
+    return "\n".join(out)
+
+
+def multi_question_keyboard(pane_id: str, options: list[str],
+                            selected: list[str]) -> InlineKeyboardMarkup:
+    """One toggle per option, its checkbox IN the button label -- the button
+    row itself shows state, not just the message body above it."""
+    rows = [
+        [InlineKeyboardButton(
+            f"{'▣' if option in selected else '□'} {option}"[:64],
+            callback_data=pane_callback_data("q_toggle", pane_id, i=str(i)),
+        )]
+        for i, option in enumerate(options)
+    ]
+    rows.append([
+        InlineKeyboardButton(f"✓ Submit ({len(selected)} selected)",
+                             callback_data=pane_callback_data("q_submit", pane_id)),
+        InlineKeyboardButton("≡ Details", callback_data=pane_callback_data("read", pane_id)),
+        InlineKeyboardButton("✎ Reply", callback_data=pane_callback_data("reply", pane_id)),
+    ])
+    history = history_button(pane_id)
+    if history:
+        rows.append(history)  # its own row: the Submit row is already three wide
+    return InlineKeyboardMarkup(rows)
+
+
 async def notify_blocked(
     app: Application,
     pane_id: str,
@@ -1641,6 +2081,11 @@ async def notify_blocked(
     detail: list[str] | None = None,
     cwd: str = "",
     branch: str = "",
+    multi_options: list[str] | None = None,
+    selected_options: list[str] | None = None,
+    multi_details: list[str] | None = None,
+    question_text: str = "",
+    update: bool = False,
 ):
     if not CHAT_ID:
         return
@@ -1648,7 +2093,7 @@ async def notify_blocked(
         import time
         msg = await app.bot.send_message(
             chat_id=int(CHAT_ID),
-            text=approval_text(project, host, cwd, branch, summary, detail, "⏳ Waiting"),
+            text=approval_text(project, host, cwd, branch, summary, detail, "‖ Waiting"),
             parse_mode="HTML",
             reply_markup=approval_keyboard(pane_id, generation := secrets.token_hex(4)),
         )
@@ -1668,8 +2113,47 @@ async def notify_blocked(
         }
         register_pending(int(CHAT_ID), msg.message_id, pane_id)
         return
+    if multi and multi_options is not None:
+        # Multi-select question card, rendered only from structured data.
+        # The first card is sent; every selection change (a button tap edits
+        # optimistically, the relay's next poll confirms authoritatively)
+        # re-renders the SAME message, so a multi-pick never becomes a stack.
+        if prompt_id:
+            blocked_prompt_ids[pane_id] = prompt_id
+        selected = list(selected_options or [])
+        card = multi_cards.get(pane_id)
+        text = multi_question_text(project, question_text, multi_options,
+                                   multi_details, selected, host=host,
+                                   submitted=bool(card and card.get("submitted")))
+        keyboard = multi_question_keyboard(pane_id, multi_options, selected)
+        if card and update:
+            try:
+                await app.bot.edit_message_text(
+                    chat_id=card["chat_id"], message_id=card["message_id"],
+                    text=text, parse_mode="HTML", reply_markup=keyboard,
+                )
+                if not card.get("submitted"):
+                    card["selected"] = selected
+                return
+            except Exception:
+                pass  # too old to edit: fall through to a fresh card
+        msg = await app.bot.send_message(
+            chat_id=int(CHAT_ID), text=text, parse_mode="HTML", reply_markup=keyboard,
+        )
+        multi_cards[pane_id] = {
+            "chat_id": int(CHAT_ID), "message_id": msg.message_id,
+            "options": list(multi_options), "details": list(multi_details or []),
+            "question": question_text, "selected": selected,
+            "project": project, "host": host, "submitted": False,
+        }
+        register_pending(int(CHAT_ID), msg.message_id, pane_id)
+        return
     # Only the unusual case explains itself: multi-select needs the web terminal.
-    body = f"*{agent}* blocked in `{project}`\n\n```\n{prompt[:400]}\n```"
+    # HTML, not Markdown: a ``` or _ in the prompt or project broke the legacy parse and the
+    # card never arrived. The whole tail is kept -- the question sits at its end -- with the
+    # context above it folded.
+    body = (f"<b>{html.escape(agent)}</b> blocked in <code>{html.escape(project)}</code>\n\n"
+            f"{folded_output(prompt, tail_lines=6)}")
     if multi:
         body += "\n\nUse the web terminal or manual terminal controls to select multiple options."
     generation = secrets.token_hex(4)
@@ -1680,7 +2164,7 @@ async def notify_blocked(
         interaction=interaction,
     )
     msg = await app.bot.send_message(
-        chat_id=int(CHAT_ID), text=body, parse_mode="Markdown", reply_markup=keyboard
+        chat_id=int(CHAT_ID), text=body, parse_mode="HTML", reply_markup=keyboard
     )
     approval_tokens[pane_id] = generation
     if prompt_id:
@@ -1689,7 +2173,12 @@ async def notify_blocked(
 
 
 async def notify_blocked_safely(app: Application, msg: dict):
-    if msg.get("update"):
+    # Updates re-render only the multi-select card (in place); everything else
+    # still drops here so a sitting prompt cannot re-ping.
+    if msg.get("update") and not (
+        msg.get("multi") and msg.get("interaction") == "omp_question"
+        and msg.get("pane_id") in multi_cards
+    ):
         return
     # Rules first: a matched safe request never interrupts Telegram at all.
     if (
@@ -1727,6 +2216,11 @@ async def notify_blocked_safely(app: Application, msg: dict):
             detail=msg.get("detail"),
             cwd=msg.get("cwd", ""),
             branch=msg.get("branch", ""),
+            multi_options=msg.get("multi_options"),
+            selected_options=msg.get("selected_options"),
+            multi_details=msg.get("multi_details"),
+            question_text=msg.get("question_text", ""),
+            update=bool(msg.get("update")),
         )
     except Exception as e:
         log.warning("Failed to send blocked notification: %s", scrub(e))
@@ -1767,7 +2261,19 @@ async def track_agent_updates(app: Application, updated_agents: list[dict]):
             blocked_prompt_ids.pop(pane_id, None)
             if pane_id in approval_messages:
                 # Answered in the terminal or pane gone: settle the card, no ping.
-                await edit_approval_message(app, pane_id, "⌛ Closed")
+                await edit_approval_message(app, pane_id, "■ Closed")
+            card = multi_cards.pop(pane_id, None)
+            if card:
+                # The multi question was answered somewhere: mark the card done.
+                try:
+                    await app.bot.edit_message_text(
+                        chat_id=card["chat_id"], message_id=card["message_id"],
+                        text=(f"✓ <b>{html.escape(agent_data.get('project') or 'agent')}</b> "
+                              "· question answered"),
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
 
         # One nudge if an approval card has been sitting for NUDGE_AFTER.
         if new_status == "blocked":
@@ -1778,9 +2284,9 @@ async def track_agent_updates(app: Application, updated_agents: list[dict]):
                 try:
                     await app.bot.send_message(
                         chat_id=int(CHAT_ID),
-                        text=(f"⏰ <b>{html.escape(agent_data.get('project') or 'agent')}</b> "
+                        text=(f"◆ <b>{html.escape(agent_data.get('project') or 'agent')}</b> "
                               f"has been waiting for approval for "
-                              f"{fmt_duration(now - approval['created'])} — the 🔐 card is above."),
+                              f"{fmt_duration(now - approval['created'])} — the approval card is above."),
                         parse_mode="HTML",
                         disable_notification=is_quiet(agent_data.get("project", "")),
                     )
@@ -1862,10 +2368,10 @@ async def track_agent_updates(app: Application, updated_agents: list[dict]):
                         card["stuck_mark"] = updated_ms
                         await app.bot.send_message(
                             chat_id=int(CHAT_ID),
-                            text=(f"🐌 <b>{html.escape(agent_data.get('project') or 'agent')}</b> "
+                            text=(f"△ <b>{html.escape(agent_data.get('project') or 'agent')}</b> "
                                   "has not touched its session in "
                                   f"{fmt_duration((now * 1000 - updated_ms) / 1000)} — possibly stuck. "
-                                  "⛔ Interrupt it or 💬 Reply from its card."),
+                                  "■ Interrupt it or ✎ Reply from its card."),
                             parse_mode="HTML",
                             disable_notification=is_quiet(agent_data.get("project", "")),
                         )
@@ -1894,7 +2400,7 @@ async def track_agent_updates(app: Application, updated_agents: list[dict]):
                                      branch=(info or {}).get("branch", ""))
                 auto = int(stats.get("auto_approved", 0))
                 if auto:
-                    text += f"\n\n🔇 {auto} auto-approved by rules"
+                    text += f"\n\n∞ {auto} auto-approved by rules"
                 keyboard = finished_keyboard(pane_id, failed)
                 card = working_cards.get(pane_id)
                 edited = False
@@ -1963,7 +2469,7 @@ async def relay_listener(app: Application):
                                 blocked_prompt_ids.pop(pane_id, None)
                                 if pane_id in approval_messages:
                                     await edit_approval_message(
-                                        app, pane_id, "⌛ Closed")
+                                        app, pane_id, "■ Closed")
                         # A pane that vanished mid-run never sends a finished
                         # status; settle its session card instead.
                         live_panes = {agent.get("pane_id") for agent in new_agents}
@@ -2015,6 +2521,7 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status, filters=auth_filter))
     app.add_handler(CommandHandler("session", cmd_session, filters=auth_filter))
     app.add_handler(CommandHandler("read", cmd_read, filters=auth_filter))
+    app.add_handler(CommandHandler("history", cmd_history, filters=auth_filter))
     app.add_handler(CommandHandler("reply", cmd_reply, filters=auth_filter))
     app.add_handler(CommandHandler("send", cmd_send, filters=auth_filter))
     app.add_handler(CommandHandler("trust", cmd_trust, filters=auth_filter))

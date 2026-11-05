@@ -3,8 +3,6 @@
 # requires-python = ">=3.10"
 # dependencies = ["python-telegram-bot>=21.0", "websockets>=14.0"]
 # ///
-import asyncio
-import ast
 import importlib
 import json
 import os
@@ -348,11 +346,11 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
             await tg.track_agent_updates(app, tg.agents)
         chat_id, text, kwargs, sent = bot.sent[0]
         self.assertEqual(chat_id, 42)
-        self.assertIn("✅ <b>completed</b> finished", text)
+        self.assertIn("✓ <b>completed</b> finished", text)
         self.assertIn("3 files changed, tests passed.", text)
         self.assertIn("<code>/work/completed/0</code>", text)
         button = kwargs["reply_markup"].inline_keyboard[0][0]
-        self.assertEqual(button.text, "👁 Details")
+        self.assertEqual(button.text, "≡ Details")
         self.assertEqual(tg.parse_callback_data(button.callback_data)["pane_id"], "w0:p1")
         self.assertEqual(tg.pending_pane(42, sent.message_id), "w0:p1")
 
@@ -367,7 +365,7 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         ):
             await tg.track_agent_updates(app, agents)
         text = bot.sent[0][1]
-        self.assertIn("❌ <b>broken</b> failed", text)
+        self.assertIn("✕ <b>broken</b> failed", text)
         self.assertIn("2 tests failed in auth.spec.ts", text)
 
     async def test_zero_failures_still_counts_as_success(self):
@@ -396,10 +394,10 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         tg.prev_statuses["w0:p1"] = "idle"
         await tg.track_agent_updates(app, make_agents(1, status="working", project="live"))
         chat_id, text, kwargs, sent = bot.sent[0]
-        self.assertIn("⚙️ <b>live</b> · working", text)
+        self.assertIn("◐ <b>live</b> · working", text)
         self.assertIn("<code>/work/live/0</code>", text)
         buttons = [b.text for b in kwargs["reply_markup"].inline_keyboard[0]]
-        self.assertEqual(buttons, ["⛔ Interrupt", "👁 Details"])
+        self.assertEqual(buttons, ["■ Interrupt", "≡ Details"])
         self.assertEqual(tg.pending_pane(chat_id, sent.message_id), "w0:p1")
         self.assertEqual(len(bot.edits), 0)
 
@@ -426,7 +424,7 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         tg.prev_statuses["w0:p1"] = "working"
         await tg.track_agent_updates(app, make_agents(1, status="blocked", project="live"))
         self.assertEqual(len(bot.edits), 1)
-        self.assertIn("⏸ <b>live</b> · waiting for approval", bot.edits[0][2])
+        self.assertIn("‖ <b>live</b> · waiting for approval", bot.edits[0][2])
 
     async def test_finish_edits_the_working_card_not_a_new_message(self):
         bot = FakeBot()
@@ -442,7 +440,7 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
             await tg.track_agent_updates(app, make_agents(1, status="done", project="live"))
         self.assertEqual(len(bot.sent), 1)          # no new message
         self.assertEqual(len(bot.edits), 1)         # the card became the result
-        self.assertIn("✅ <b>live</b> finished", bot.edits[0][2])
+        self.assertIn("✓ <b>live</b> finished", bot.edits[0][2])
         # The rolling card stays as this pane's slot, now in finished state.
         self.assertEqual(tg.working_cards["w0:p1"]["state"], "finished")
 
@@ -461,7 +459,7 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         await tg.track_agent_updates(app, make_agents(1, status="working", project="live"))
         self.assertEqual(len(bot.sent), 1)          # still one message
         self.assertEqual(len(bot.edits), 2)         # finish + resume
-        self.assertIn("⚙️ <b>live</b> · working", bot.edits[1][2])
+        self.assertIn("◐ <b>live</b> · working", bot.edits[1][2])
 
     async def test_restart_beyond_grace_gets_a_new_card(self):
         import time
@@ -584,13 +582,13 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
     def test_web_button_appears_only_with_hostname(self):
         with patch.object(tg, "_web_base", return_value="https://relay.example.com"):
             keyboard = tg.working_keyboard("w0:p1")
-            web = [b for row in keyboard.inline_keyboard for b in row if b.text == "🌐 Web"]
+            web = [b for row in keyboard.inline_keyboard for b in row if b.text == "↗︎ Web"]
             self.assertEqual(len(web), 1)
             self.assertEqual(web[0].url, "https://relay.example.com/?pane=w0:p1")
         with patch.object(tg, "_web_base", return_value=""):
             keyboard = tg.finished_keyboard("w0:p1", failed=True)
             texts = [b.text for row in keyboard.inline_keyboard for b in row]
-            self.assertEqual(texts, ["🔁 Retry", "👁 Details", "💬 Reply"])
+            self.assertEqual(texts, ["↻ Retry", "≡ Details", "✎ Reply"])
 
     async def test_now_lists_one_card_per_active_session(self):
         tg.relay_connected = True
@@ -614,15 +612,15 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(replies), 2)  # idle agent is not listed
         first_text, first_kwargs, _ = replies[0]
         second_text, second_kwargs, _ = replies[1]
-        self.assertIn("⏸ <b>beta</b> · waiting for approval", first_text)   # blocked sorts first
-        self.assertIn("⚙️ <b>alpha</b> · working", second_text)
+        self.assertIn("‖ <b>beta</b> · waiting for approval", first_text)   # blocked sorts first
+        self.assertIn("◐ <b>alpha</b> · working", second_text)
         self.assertIn("Context: 217,447 tokens · 22%", second_text)
         self.assertIn("[•] Backend: portal login", second_text)
         self.assertIn("[ ] Frontend: feature module", second_text)
         self.assertIn("Todo 1/3", second_text)
         for kwargs in (first_kwargs, second_kwargs):
             buttons = [b.text for b in kwargs["reply_markup"].inline_keyboard[0]]
-            self.assertEqual(buttons, ["⛔ Interrupt", "👁 Details"])
+            self.assertEqual(buttons, ["■ Interrupt", "≡ Details"])
 
     def test_session_details_truncate_todos_and_hide_unknown_model_pct(self):
         info = {
@@ -680,7 +678,7 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("1. nodehr · always · npm run build", text)
             self.assertIn("2. checkwiseweb · project · all safe actions", text)
             buttons = [b for row in kwargs["reply_markup"].inline_keyboard for b in row]
-            self.assertEqual([b.text for b in buttons], ["🗑 1", "🗑 2"])
+            self.assertEqual([b.text for b in buttons], ["✕ 1", "✕ 2"])
 
             callback = FakeCallback({"action": "rule_del", "i": 0})
             await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
@@ -697,7 +695,7 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         tg.working_cards.pop("w0:p1", None)
         with patch.object(tg, "read_pane", AsyncMock(return_value="ok")):
             await tg.track_agent_updates(app, make_agents(1, status="done", project="auto"))
-        self.assertIn("🔇 2 auto-approved by rules", bot.sent[0][1])
+        self.assertIn("∞ 2 auto-approved by rules", bot.sent[0][1])
 
     async def test_page_callback_rebuilds_from_latest_cache(self):
         tg.relay_connected = True
@@ -904,7 +902,7 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         text, kwargs, _ = list_update.message.replies[0]
         self.assertEqual(kwargs.get("parse_mode"), "HTML")
         self.assertIn("<b>local</b>", text)
-        self.assertIn("▶ main", text)
+        self.assertIn("● main", text)
         self.assertIn("scratch (stopped)", text)
 
         # One argument switches the local source (no host key); two name a host.
@@ -930,22 +928,6 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         with patch("websockets.connect", return_value=FakeRelayConnection(rejected)):
             await tg.cmd_session(failed_update, SimpleNamespace(args=["nope"]))
         self.assertIn("unknown session: nope", failed_update.message.replies[0][0])
-
-    def test_relay_allows_numeric_approval_keys_and_acknowledges_them(self):
-        relay_path = ROOT / "relay" / "herdr_relay.py"
-        source = relay_path.read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        safe_keys = next(
-            node.value
-            for node in tree.body
-            if isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Name) and target.id == "SAFE_KEYS" for target in node.targets)
-        )
-        values = eval(compile(ast.Expression(safe_keys), str(relay_path), "eval"), {"range": range})
-        self.assertTrue({"1", "2", "3"}.issubset(values))
-        self.assertIn('"command": "send_keys"', source)
-        self.assertIn('"ok": True', source)
-        self.assertIn("if result.returncode != 0:", source)
 
     async def test_omp_choice_uses_question_response_with_label_and_prompt_id(self):
         tg.relay_connected = True
@@ -1131,7 +1113,7 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         chat_id, text, kwargs, sent = bot.sent[0]
         rows = kwargs["reply_markup"].inline_keyboard
         self.assertEqual([json.loads(row[0].callback_data)["k"] for row in rows[:3]], ["1", "2", "3"])
-        self.assertEqual([button.text for button in rows[-1]], ["👁 Details", "💬 Reply"])
+        self.assertEqual([button.text for button in rows[-1]], ["≡ Details", "✎ Reply"])
         self.assertNotIn("Use an approval button", text)
         self.assertEqual(tg.pending_pane(chat_id, sent.message_id), "w0:p1")
 

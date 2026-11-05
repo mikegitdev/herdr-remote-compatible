@@ -8,7 +8,7 @@ import asyncio, json, os, sys
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Header, Footer, Static, Input, Button, Label, Rule
+from textual.widgets import Header, Footer, Static, Input, Button, Label
 from textual.reactive import reactive
 from textual.message import Message
 from textual import work
@@ -130,7 +130,6 @@ class HerdrRemoteTUI(App):
 
     agents: reactive[list] = reactive(list, recompose=True)
     connected: reactive[bool] = reactive(False)
-    blocked_agents: reactive[list] = reactive(list)
 
     def __init__(self):
         super().__init__()

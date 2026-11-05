@@ -127,16 +127,5 @@ class WebAssetContainmentTests(unittest.TestCase):
                     self.assertIsNone(relay.web_asset(path))
 
 
-class WebAssetAuthTests(unittest.TestCase):
-    def test_assets_are_exempt_from_the_token_but_the_app_is_not(self):
-        """A browser fetches the stylesheet and the scripts before it can authenticate."""
-        source = (ROOT / "relay" / "herdr_relay.py").read_text(encoding="utf-8")
-        # The exemption is written as an extra condition on the auth branch, so it can only ever
-        # widen to what web_asset resolves -- and web_asset refuses index.html.
-        self.assertIn(
-            "if AUTH_TOKEN and request_path not in public_paths and web_asset(request_path) is None:",
-            source)
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -119,6 +119,7 @@ uv run relay/herdr_telegram.py
 | `/start` | Show the clickable agent dashboard |
 | `/agents` | List all with status |
 | `/read` | Read agent output |
+| `/history` | The agent's conversation from its transcript, paged with Older / Latest |
 | `/reply` | Read + respond in one flow |
 | `/send` | Send text to an agent |
 | `/trust` | Trust all tools for blocked agent |

@@ -515,7 +515,7 @@ panel's own centre, at both phone and desktop widths.
 Messages are JSON with a `type` field:
 
 **Server → Client:** `agents` (complete state snapshot, plus the `spaces` hierarchy), `agent_update` (single-pane state merge), `blocked` (approval prompt), `pane_content` (terminal read), `sessions` (per-source herdr session lists and the active selection), `history` (transcript turns, or `unavailable` with a reason), `command_result` / `tab_created` (did the mutation land), `error`
-**Server → Client:** `agents` (complete state snapshot, plus the `spaces` hierarchy and the `panes` list), `agent_update` (single-pane state merge), `blocked` (approval prompt), `pane_content` (terminal read), `history` (transcript turns, or `unavailable` with a reason), `command_result` / `tab_created` (did the mutation land), `error`
+**Server → Client:** `agents` (complete state snapshot, plus the `spaces` hierarchy, the `panes` list and per-host `hosts` reachability), `agent_update` (single-pane state merge), `blocked` (approval prompt), `pane_content` (terminal read), `history` (transcript turns, or `unavailable` with a reason), `command_result` / `tab_created` (did the mutation land), `error`
 
 **Client → Server:** `respond` (send text to agent), `read_pane` (request terminal content), `send_keys` (send key sequences), `send_text` (raw text without newline), `agent_prompt` (submit free-form text via `herdr agent prompt`), `session_switch` (point one source at a herdr session; `session: null` follows herdr's default), `get_history`, `focus`, `create_tab`, `rename_tab`, `close_tab`, `rename_agent`, `push_subscribe`/`push_unsubscribe`
 
@@ -578,6 +578,46 @@ distinct `cwd` basenames, so eight of them are indistinguishable from a sibling 
 2.5ms locally but it is **one call per pane**, which is one SSH round trip per pane, so it never
 enters the poll. `read_pane` takes an optional `process: true` and answers with
 `process: {name, cmdline}`; a client asks when it *opens* a pane, not on every mirror refresh.
+
+### Staying up: what the relay does when something fails
+
+Each of these was a way one fault took down more than itself:
+
+- **A failed host read is not an empty host** (`poll_host`). `list_panes_from_host` returns `None`
+  when `pane list` gives no parseable answer, and the host's last good list is served for
+  `HOST_STALE_AFTER` (60s). Before, one SSH timeout swept every pane on that host — its agents
+  blinked out of every client, unread state was forgotten, and each blocked one was pushed again
+  when it came back. A failing *remote* is retried on a backoff (4s, 8s, … `HOST_BACKOFF_MAX`) so a
+  dead host stops costing every poll its connect timeout; local is always re-read. Hosts are polled
+  **in parallel**. The `agents` message carries **`hosts`**: `[{host, ok, down_since}]`, holding
+  only fields that change when a host's state does (a per-poll timestamp would defeat the dedupe
+  below). No client renders it yet.
+- **Connecting costs no herdr call.** `send_current_snapshot` serves `last_snapshot` (the last poll's
+  `agents` message, at most one tick old) and `last_blocked_messages`. It used to poll every host
+  and read every blocked pane per connect, so a reconnect storm after a restart or a tunnel flap was
+  one full fan-out per client. Measured: 20 simultaneous connects all served in 10ms. Both caches
+  are cleared by `reset_pane_state`, with `host_state`, because after a session switch they are the
+  old session's.
+- **An unchanged `agents` snapshot is not re-sent** (`broadcast_agents(dedupe=True)`) — except every
+  `AGENTS_HEARTBEAT` (20s), because the Telegram bot runs its approval nudge and its working-card
+  refresh off each `agents` message and an idle herd would otherwise trigger neither.
+- **Broadcast sends to every client at once**, each with `BROADCAST_SEND_TIMEOUT`; a client still
+  not drained after it is aborted. One after another, a phone on a stalled link held every other
+  client, and the poll awaiting the broadcast, until its ping timed out.
+- **A handler that raises answers that one message** (`error_reply(msg, "request failed")`) and the
+  connection keeps reading; it used to end the connection. Non-object JSON is ignored and a
+  non-string `pane_id` refused before any handler runs.
+- **`event_push` survives a bad event.** Its body is `_push_event`; the loop logs and drops whatever
+  raises. It used to end on the first one, leaving the relay silently poll-only until restarted.
+  Intake (UDP and `?d=`) also drops anything that is not a JSON object.
+- **`?d=` without a token is accepted only from this machine** (`direct_local_request`): loopback
+  *and* no forwarding header, because cloudflared connects from loopback too. A pushed blocked event
+  carries its own prompt text, so anyone who could reach the tunnel could have put a fake approval in
+  front of the operator. With a token set, the token check already covers it — compared with
+  `hmac.compare_digest` on bytes.
+- **`/healthz`** is public and names no host: `{ok, uptime_s, poll_age_s, tasks_down, hosts,
+  hosts_down, clients}`, 503 when the poll is older than `HEALTH_POLL_STALE` (30s) or a background
+  task has ended — the "running but stuck" state a process check cannot see.
 
 ### The relay is single-threaded; every herdr call is not
 
@@ -678,7 +718,9 @@ appeared for the people on a tunnel.
 - **`respond` is allowlisted.** Only the 12 values in `SAFE_RESPONSES` (`herdr_relay.py:90`) are accepted; anything else returns `response not in allowlist`. Free-form replies must use `agent_prompt` (≤10000 chars) or `send_text` (≤1000). The mac/iOS approval cards send custom text as `respond`, so their custom-reply box does not work against the relay.
 - **Keys use herdr's `+` grammar, validated by `key_is_allowed`, and `keys` must be a non-empty array.** Bare specials (`Enter` `Escape` `Tab` `Space` `Backspace` `Up`…`F12`), single characters, and `ctrl+`/`shift+`/`alt+` chords all pass — special names case-insensitively, so `esc` and `shift+tab` are fine. `C-c` also passes: live-verified as the one tmux-style spelling herdr 0.8.0 still aliases to interrupt (`C-u`, `M-x`, `BTab` do not). `BSpace`, `Insert` and `Delete` are rejected by herdr in any spelling.
 - **`PageUp`, `PageDown`, `Home` and `End` are sent as bytes, not as keys.** herdr's own validator refuses every spelling of them (re-probed on 0.8.2: `PgUp`, `pageup`, `Page_Up` and `ctrl+Home` all answer `unsupported key`), so `key_escape_sequence` turns them into the CSI bytes a terminal emits and the relay ships that through `pane send-text` instead — `pane send-text` is a byte channel and passes ESC verbatim. Modified forms are computed, not enumerated: xterm's `1 + shift(1) + alt(2) + ctrl(4)`, so `ctrl+Home` is `ESC[1;5H` and `shift+PageUp` is `ESC[5;2~`. A mixed `keys` array keeps its order — consecutive keys of one kind travel in one CLI call, so `[Escape, PageUp, PageDown, Enter]` becomes send-keys / send-text / send-keys, in that order. Clients still just send the key name.
-- **`question_toggle`/`question_submit` have no relay handler.** The web app, TUI, mac and iOS clients all send them; the relay ignores both, so multi-select questions cannot be answered from any client until it grows support.
+- **`question_toggle`/`question_submit` are handled** (they were not, once): each re-checks `prompt_id` first and refuses a question that changed. With a `request_id` they answer `command_result`; without one, silence on success is still the contract the web client relies on.
+- **Every command answers, correlated.** Errors carry the caller's `request_id` (`error_reply`), and `send_text` / `agent_prompt` / `focus` / `rename_*` / `close_tab` answer `command_result` through `command_reply` — `send_text` used to answer nothing, and `agent_prompt` said `ok: true` whatever herdr returned. `create_tab` keeps its own `tab_created` shape, plus `request_id`.
+- **A pane id two hosts both report is refused** (`ambiguous_panes`), for the reason workspace ids are: herdr numbers panes per host (`w11:p1` exists on any host that has had eleven workspaces), and `known_panes` / `pane_remote_map` are keyed by bare id, so a command could land on either machine. Every message naming one gets an error instead.
 - **Workspace and tab ids are only unique within one host.** Every herdr numbers its own spaces
   w1, w2, … so a client that watches more than one host must send `host` alongside
   `workspace_id`/`tab_id`. `resolve_space` serves an id with no host while it is unambiguous and

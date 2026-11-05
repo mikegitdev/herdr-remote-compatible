@@ -105,8 +105,6 @@ body { font-family: var(--font-mono); background: var(--bg); color: var(--text);
 .agent:active { transform: scale(0.99); box-shadow: none; }
 .agent .dot { width: 10px; height: 10px; }
 .agent.blocked { border-color: var(--red); background: color-mix(in srgb, var(--red) 5%, var(--surface)); }
-.workspace-card { border-color: color-mix(in srgb, var(--text) 10%, transparent); }
-.count-pill { display: inline-block; padding: 1px 6px; border-radius: 4px; background: color-mix(in srgb, var(--text) 8%, transparent); font-size: 0.65rem; }
 .chip-strip { display: flex; align-items: center; gap: 8px; overflow-x: auto; padding: 8px 12px; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
 .chip-strip::-webkit-scrollbar { display: none; }
 .chip-label { font-size: 0.65rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); white-space: nowrap; }

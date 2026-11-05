@@ -447,7 +447,7 @@ class RelayActivityPersistenceTests(unittest.TestCase):
                 "run_herdr",
                 side_effect=[self._pane_list(), self._workspace_list()],
             ):
-                agents = relay.get_agents_from_host()
+                agents = relay.list_panes_from_host()[0]
 
             # Without this, clients fall back to the cwd basename ("personal").
             self.assertEqual(agents[0]["workspace_label"], "central AC")
@@ -459,7 +459,7 @@ class RelayActivityPersistenceTests(unittest.TestCase):
                 "run_herdr",
                 side_effect=[self._pane_list(label="pane name"), self._workspace_list()],
             ):
-                agents = relay.get_agents_from_host()
+                agents = relay.list_panes_from_host()[0]
 
             # Tab chips key off label, so it must stay pane-scoped.
             self.assertEqual(agents[0]["label"], "pane name")
@@ -472,7 +472,7 @@ class RelayActivityPersistenceTests(unittest.TestCase):
                 "run_herdr",
                 side_effect=[self._pane_list(), self._workspace_list()],
             ):
-                agents = relay.get_agents_from_host()
+                agents = relay.list_panes_from_host()[0]
 
             self.assertEqual(agents[0]["label"], "")
 
@@ -485,7 +485,7 @@ class RelayActivityPersistenceTests(unittest.TestCase):
                         "run_herdr",
                         side_effect=[self._pane_list(), raw],
                     ):
-                        agents = relay.get_agents_from_host()
+                        agents = relay.list_panes_from_host()[0]
 
                     self.assertEqual(agents[0]["workspace_label"], "")
                     self.assertEqual(agents[0]["project"], "personal")
@@ -499,7 +499,7 @@ class RelayActivityPersistenceTests(unittest.TestCase):
                 return "not json"
 
             with mock.patch.object(relay, "run_herdr", side_effect=record):
-                self.assertEqual(relay.get_agents_from_host(), [])
+                self.assertIsNone(relay.list_panes_from_host())
 
             # An unreachable SSH remote should not cost a second timeout.
             self.assertEqual(calls, [("pane", "list")])
@@ -2108,7 +2108,7 @@ class RelayEventPushTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     messages,
                     [
-                        {"type": "agents", "agents": expected_agents, "panes": []},
+                        {"type": "agents", "agents": expected_agents, "panes": [], "hosts": []},
                         {
                             "type": "blocked",
                             "pane_id": "event-pane",
@@ -2314,7 +2314,7 @@ class RelayTerminalTitleTests(unittest.TestCase):
         with loaded_relay() as relay:
             with mock.patch.object(relay, "run_herdr", return_value=listing), \
                  mock.patch.object(relay, "get_workspace_labels", return_value={}):
-                agents = relay.get_agents_from_host()
+                agents = relay.list_panes_from_host()[0]
             self.assertEqual([a["title"] for a in agents], ["fix the poll", ""])
 
 
@@ -2614,7 +2614,7 @@ class RelayPaneFieldTests(unittest.TestCase):
     def test_agent_entries_carry_scrollback_depth_title_and_session_presence(self):
         with loaded_relay() as relay:
             with mock.patch.object(relay, "run_herdr", return_value=json.dumps(self.PANE_LIST)):
-                agents = relay.get_agents_from_host()
+                agents = relay.list_panes_from_host()[0]
 
             self.assertEqual([a["pane_id"] for a in agents], ["w0:p1"])
             agent = agents[0]
@@ -2634,7 +2634,7 @@ class RelayPaneFieldTests(unittest.TestCase):
         panes["result"]["panes"][0]["agent"] = "pi"
         with loaded_relay() as relay:
             with mock.patch.object(relay, "run_herdr", return_value=json.dumps(panes)):
-                agents = relay.get_agents_from_host()
+                agents = relay.list_panes_from_host()[0]
             self.assertFalse(agents[0]["has_session"])
             self.assertNotIn("w0:p1", relay.pane_session_map)
 
@@ -3122,6 +3122,39 @@ class RelayShellPaneTests(unittest.TestCase):
                 asked_for_it = any(c.args[:2] == ("pane", "process-info")
                                    for c in run.call_args_list)
                 self.assertEqual(asked_for_it, asked)
+
+
+class RelayHostFailureTests(unittest.TestCase):
+    def test_a_failed_pane_list_keeps_the_hosts_panes_until_it_is_believed_gone(self):
+        """One timeout used to read as "this host has no panes": the stale sweep forgot them, so
+        the agents blinked out of every client and each blocked one was pushed again on return."""
+        good = RelayShellPaneTests.PANE_LIST
+        with loaded_relay() as relay:
+            replies = [good, ""]    # the second poll gets no answer at all
+
+            def herdr(*args, remote=None):
+                if args[:2] == ("pane", "list"):
+                    return replies.pop(0)
+                return ""
+
+            with mock.patch.object(relay, "run_herdr", side_effect=herdr):
+                relay.update_pane_maps(*relay.get_all_panes())
+                relay.last_blocked_prompts["w1:p1"] = ("pid", (), "Allow?")
+                agents, shells = relay.get_all_panes()
+                relay.update_pane_maps(agents, shells)
+
+            self.assertEqual([a["pane_id"] for a in agents], ["w1:p1"])
+            self.assertIn("w1:p1", relay.known_panes)
+            self.assertEqual(relay.last_blocked_prompts["w1:p1"], ("pid", (), "Allow?"))
+            [health] = relay.host_health()
+            self.assertEqual((health["host"], health["ok"]), ("local", False))
+            self.assertIsInstance(health["down_since"], int)
+
+            # Still failing past HOST_STALE_AFTER: now the host's panes really are gone.
+            relay.host_state["local"]["last_ok"] -= relay.HOST_STALE_AFTER + 1
+            with mock.patch.object(relay, "run_herdr", return_value=""):
+                agents, shells = relay.get_all_panes()
+            self.assertEqual((agents, shells), ([], []))
 
 
 class RelayPaneWalkTests(unittest.TestCase):

@@ -184,7 +184,7 @@ public sealed partial class HerdrPoller : IDisposable
 
     /// <summary>
     /// Parse `herdr pane list` output. Same projection as the relay's
-    /// get_agents_from_host (herdr_relay.py:226), except remote pane ids are prefixed with
+    /// list_panes_from_host (herdr_relay.py), except remote pane ids are prefixed with
     /// their host: unlike the relay, nothing here keeps a pane-to-host side table, so the
     /// id has to carry the host or two machines' panes could collide under one id.
     /// </summary>
